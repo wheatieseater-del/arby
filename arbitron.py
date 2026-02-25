@@ -80,6 +80,9 @@ CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.5"
+
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
 BOT_VERSION = "v2026.02.25.4"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
@@ -1640,6 +1643,19 @@ class Trader:
         if self.collect_mode:
             self.btc_fetch_min_interval_s = min(self.btc_fetch_min_interval_s, 0.05)
 
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
     def remaining_budget(self) -> float:
         return max(0.0, self.max_spend_usd - self.spent_est)
 
@@ -2984,6 +3000,7 @@ th{{background:#1a2448}}
 
     def _try_inventory_risk_sell(self, books: TopOfBook, pos: PositionSnapshot) -> bool:
         """Reduce oversized one-sided exposure by selling inventory before opening new buys."""
+        self._ensure_runtime_guards()
         if self.auth_broken or self.funds_blocked or self.fee_broken:
             self._record_skip("risk_sell:trading_paused")
             return False
@@ -4872,6 +4889,7 @@ th{{background:#1a2448}}
         return float(cash) + up_mark + dn_mark
 
     def step(self) -> Tuple[TopOfBook, PositionSnapshot, str, WalletDebug, RuntimeStats, str]:
+        self._ensure_runtime_guards()
         self._recheck_pending_fills()
         self.session_bought_shares = self._current_market_session_bought_shares()
         books = self.fetch_books()
@@ -4924,6 +4942,7 @@ th{{background:#1a2448}}
             or self.collect_mode
             or bool(self.pending_fill_checks)
             or bool(self.pending_unwind_sell_checks)
+            or bool(self.pending_risk_sell_checks)
             or (time.time() < self.pair_fill_grace_until_ts)
         )
         sold_risk = False if hold_risk_sells else self._try_inventory_risk_sell(books, pos_guard)

@@ -2271,6 +2271,11 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
+    def _is_allowed_original_arb_buy_price(self, price: float) -> bool:
+        if not self._is_original_arb_mode():
+            return True
+        return 0.45 <= float(price) <= 0.55
+
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
             return None
@@ -3237,6 +3242,10 @@ th{{background:#1a2448}}
                 self._record_skip("instant:nudged_sum_ge_1")
                 return
 
+        if (not self._is_allowed_original_arb_buy_price(up_buy_px)) or (not self._is_allowed_original_arb_buy_price(dn_buy_px)):
+            self._record_skip("instant:price_band")
+            return
+
         self.opps_met += 1
         # Execute two buys (not atomic)
         pair_id = f"instant-{int(time.time() * 1000)}-{self.executed_trade_count}"
@@ -3318,15 +3327,18 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
-                        ts = now_utc().astimezone().strftime("%H:%M:%S")
-                        action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("complete bundles", books.dn_ask, books.dn_ask), ok, err)
-                        self.log_action(action)
-                        if (not ok) and ("order_not_filled_immediately" in (err or "")):
-                            self._queue_pending_fill_check(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles", err, action)
-                        if ok:
-                            self._record_purchase(self.meta.token_ids[1], books.dn_ask, qty)
-                            self.spent_est += self.est_effective_cost(books.dn_ask * qty)
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask):
+                            self._record_skip("complete_down:price_band")
+                        else:
+                            ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
+                            action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("complete bundles", books.dn_ask, books.dn_ask), ok, err)
+                            self.log_action(action)
+                            if (not ok) and ("order_not_filled_immediately" in (err or "")):
+                                self._queue_pending_fill_check(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles", err, action)
+                            if ok:
+                                self._record_purchase(self.meta.token_ids[1], books.dn_ask, qty)
+                                self.spent_est += self.est_effective_cost(books.dn_ask * qty)
 
         # If you have unhedged DOWN, try buying UP to complete
         if books.up_ask is not None and pos.unhedged_down > 0:
@@ -3345,15 +3357,18 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
-                        ts = now_utc().astimezone().strftime("%H:%M:%S")
-                        action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("complete bundles", books.up_ask, books.up_ask), ok, err)
-                        self.log_action(action)
-                        if (not ok) and ("order_not_filled_immediately" in (err or "")):
-                            self._queue_pending_fill_check(self.meta.token_ids[0], books.up_ask, qty, "complete bundles", err, action)
-                        if ok:
-                            self._record_purchase(self.meta.token_ids[0], books.up_ask, qty)
-                            self.spent_est += self.est_effective_cost(books.up_ask * qty)
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask):
+                            self._record_skip("complete_up:price_band")
+                        else:
+                            ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
+                            action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("complete bundles", books.up_ask, books.up_ask), ok, err)
+                            self.log_action(action)
+                            if (not ok) and ("order_not_filled_immediately" in (err or "")):
+                                self._queue_pending_fill_check(self.meta.token_ids[0], books.up_ask, qty, "complete bundles", err, action)
+                            if ok:
+                                self._record_purchase(self.meta.token_ids[0], books.up_ask, qty)
+                                self.spent_est += self.est_effective_cost(books.up_ask * qty)
 
     def try_build_inventory(self, books: TopOfBook, pos: PositionSnapshot):
         if not self._can_open_new_buy():
@@ -3412,6 +3427,10 @@ th{{background:#1a2448}}
             if not self._can_buy_with_loss_limit(delta_up, delta_dn, added_paid, self.unhedged_usd_max):
                 self._record_skip("build:settlement_guard")
                 return
+
+        if not self._is_allowed_original_arb_buy_price(px):
+            self._record_skip("build:price_band")
+            return
 
         ok, err = self._post_buy(token, px, qty, "build inventory")
         ts = now_utc().astimezone().strftime("%H:%M:%S")

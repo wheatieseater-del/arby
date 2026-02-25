@@ -80,6 +80,9 @@ CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.4"
+
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
 BOT_VERSION = "v2026.02.25.3"
 
 # eth-account (usually installed via py-clob-client deps)
@@ -3069,6 +3072,7 @@ th{{background:#1a2448}}
         action = TradeAction(ts, "SELL", side, qty, sell_px, f"risk rebalance sell {side} ({reason})", ok, err)
         self.log_action(action)
         if not ok:
+            self.risk_sell_next_retry_ts[side] = max(self.risk_sell_next_retry_ts.get(side, 0.0), time.time() + 2.5)
             if "order_not_filled_immediately" in (err or ""):
                 sell_oid = self._extract_order_id_any(err or "")
                 if sell_oid:

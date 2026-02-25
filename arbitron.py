@@ -2272,15 +2272,10 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
-    def _is_allowed_original_arb_buy_price(self, price: float, *, allow_completion_discount: bool = False) -> bool:
+    def _is_allowed_original_arb_buy_price(self, price: float) -> bool:
         if not self._is_original_arb_mode():
             return True
-        px = float(price)
-        if 0.45 <= px <= 0.55:
-            return True
-        if allow_completion_discount and px < 0.45:
-            return True
-        return False
+        return 0.45 <= float(price) <= 0.55
 
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
@@ -3150,9 +3145,8 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
-        allow_completion_discount = "complete bundles" in (note or "").lower()
-        if not self._is_allowed_original_arb_buy_price(price, allow_completion_discount=allow_completion_discount):
-            return False, "price_band_reject"
+        if self._is_original_arb_mode() and not (0.45 <= float(price) <= 0.55):
+            return False, "Original arbitrage mode buy price must be within $0.45-$0.55"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)
@@ -3400,7 +3394,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.dn_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask):
                             self._record_skip("complete_down:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
@@ -3430,7 +3424,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.up_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask):
                             self._record_skip("complete_up:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")

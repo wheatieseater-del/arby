@@ -82,6 +82,9 @@ CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
 BOT_VERSION = "v2026.02.25.8"
 
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.7"
+
 # eth-account (usually installed via py-clob-client deps)
 try:
     from eth_account import Account
@@ -1575,12 +1578,7 @@ class Trader:
         self.pending_pair_unwinds: Dict[str, Dict[str, Any]] = {}
         self.pending_unwind_sell_checks: List[Dict[str, Any]] = []
         self.pending_risk_sell_checks: List[Dict[str, Any]] = []
-        self.risk_sell_side_hold_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        self.risk_sell_settle_gate: Dict[str, Dict[str, float]] = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
-        self.risk_sell_next_retry_ts: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        self.risk_sell_confirm_wait_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
         self.post_risk_rebalance_cooldown_until_ts = 0.0
-        self.require_rebuild_after_risk_sell = False
         self.pair_fill_grace_until_ts = 0.0
         self.next_pending_recheck_ts = 0.0
         self.pending_recheck_interval_s = 2.0
@@ -1652,6 +1650,45 @@ class Trader:
             self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
         if not isinstance(getattr(self, "risk_sell_confirm_wait_until", None), dict):
             self.risk_sell_confirm_wait_until = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
         if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
             self.post_risk_rebalance_cooldown_until_ts = 0.0
         if not hasattr(self, "require_rebuild_after_risk_sell"):
@@ -1900,6 +1937,52 @@ class Trader:
                 if "risk rebalance sell" in (action.note or "").lower():
                     self.require_rebuild_after_risk_sell = True
                     self.risk_sell_confirm_wait_until[side] = max(self.risk_sell_confirm_wait_until.get(side, 0.0), time.time() + 12.0)
+                self.logger.info("Action reconciled as filled from position delta; action=SELL side=%s shares=%.4f", side, action.shares)
+
+    def _reconcile_recent_actions_from_position_delta(self, prev_pos: PositionSnapshot, cur_pos: PositionSnapshot):
+        """Mark recent uncertain failed actions as confirmed when position delta proves fill happened."""
+        now_ts = time.time()
+        deltas = {
+            "UP": max(0.0, cur_pos.up.size - prev_pos.up.size),
+            "DOWN": max(0.0, cur_pos.down.size - prev_pos.down.size),
+        }
+        sell_deltas = {
+            "UP": max(0.0, prev_pos.up.size - cur_pos.up.size),
+            "DOWN": max(0.0, prev_pos.down.size - cur_pos.down.size),
+        }
+
+        def _is_uncertain_err(msg: str) -> bool:
+            m = (msg or "").lower()
+            return (
+                "order_not_filled_immediately" in m
+                or "request exception" in m
+                or "status_code=none" in m
+                or "not enough balance" in m
+                or "allowance" in m
+            )
+
+        for action in reversed(self.action_history):
+            if action.ok:
+                continue
+            if (now_ts - float(action.ts_epoch or now_ts)) > 90:
+                break
+            side = (action.side or "").upper()
+            if side not in {"UP", "DOWN"}:
+                continue
+            if action.action.upper() == "BUY" and deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                self.last_success_trade_ts = time.time()
+                deltas[side] = max(0.0, deltas[side] - action.shares)
+                self.logger.info("Action reconciled as filled from position delta; action=BUY side=%s shares=%.4f", side, action.shares)
+            elif action.action.upper() == "SELL" and sell_deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                sell_deltas[side] = max(0.0, sell_deltas[side] - action.shares)
                 self.logger.info("Action reconciled as filled from position delta; action=SELL side=%s shares=%.4f", side, action.shares)
 
     def export_trade_csv(self, out_dir: str, tz_name: str = "America/Toronto") -> Optional[str]:
@@ -2344,15 +2427,10 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
-    def _is_allowed_original_arb_buy_price(self, price: float, *, allow_completion_discount: bool = False) -> bool:
+    def _is_allowed_original_arb_buy_price(self, price: float) -> bool:
         if not self._is_original_arb_mode():
             return True
-        px = float(price)
-        if 0.45 <= px <= 0.55:
-            return True
-        if allow_completion_discount and px < 0.45:
-            return True
-        return False
+        return 0.45 <= float(price) <= 0.55
 
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
@@ -3110,39 +3188,6 @@ th{{background:#1a2448}}
         if any(str(x.get("side") or "") == side for x in self.pending_risk_sell_checks):
             self._record_skip(f"risk_sell:pending:{side}")
             return False
-        now_ts = time.time()
-        if now_ts < float(self.risk_sell_next_retry_ts.get(side, 0.0)):
-            self._record_skip(f"risk_sell:retry_wait:{side}")
-            return False
-
-        settle_gate = self.risk_sell_settle_gate.get(side, {"until": 0.0, "target": 0.0})
-        gate_until = float(settle_gate.get("until") or 0.0)
-        gate_target = max(0.0, float(settle_gate.get("target") or 0.0))
-        if gate_until > 0:
-            if held <= (gate_target + 0.05):
-                if bool(settle_gate.get("set_rebuild")):
-                    self.require_rebuild_after_risk_sell = True
-                    self.post_risk_rebalance_cooldown_until_ts = max(
-                        self.post_risk_rebalance_cooldown_until_ts,
-                        time.time() + max(3.0, self.poll_s * 6.0),
-                    )
-                self.risk_sell_settle_gate[side] = {"until": 0.0, "target": 0.0}
-            elif now_ts < gate_until:
-                self._record_skip(f"risk_sell:settle_wait:{side}")
-                return False
-            else:
-                self.risk_sell_settle_gate[side]["until"] = 0.0
-
-        if now_ts < float(self.risk_sell_confirm_wait_until.get(side, 0.0)):
-            if held <= (gate_target + 0.05):
-                self.risk_sell_confirm_wait_until[side] = 0.0
-            else:
-                self._record_skip(f"risk_sell:confirm_wait:{side}")
-                return False
-
-        if time.time() < float(self.risk_sell_side_hold_until.get(side, 0.0)):
-            self._record_skip(f"risk_sell:side_hold:{side}")
-            return False
 
         pnl_per_share = bid - avg
         panic_mode = pnl_per_share <= -0.10
@@ -3182,35 +3227,8 @@ th{{background:#1a2448}}
                 sell_oid = self._extract_order_id_any(err or "")
                 if sell_oid:
                     self._queue_pending_risk_sell_check(side, token, sell_oid, qty, sell_px, reason, action)
-                    self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-                    self.risk_sell_settle_gate[side] = {
-                        "until": time.time() + 12.0,
-                        "target": max(0.0, held - qty),
-                        "set_rebuild": 1.0,
-                    }
                     self._record_skip("risk_sell:pending_recheck")
                     return False
-            low = (err or "").lower()
-            if "not enough balance" in low or "allowance" in low:
-                # A previous sell likely filled and local positions are stale. Pause retries for this side.
-                self.risk_sell_settle_gate[side] = {
-                    "until": time.time() + 12.0,
-                    "target": max(0.0, held - max(0.1, qty * 0.5)),
-                    "set_rebuild": 1.0,
-                }
-                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
-                self._record_skip(f"risk_sell:balance_settle_wait:{side}")
-                return False
-            if "request exception" in low or "status_code=none" in low:
-                # Network-level uncertainty: treat as potentially filled and wait for position settle before retrying.
-                self.risk_sell_settle_gate[side] = {
-                    "until": time.time() + 14.0,
-                    "target": max(0.0, held - max(0.1, qty * 0.5)),
-                    "set_rebuild": 1.0,
-                }
-                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
-                self._record_skip(f"risk_sell:network_settle_wait:{side}")
-                return False
             self._record_skip("risk_sell:failed")
             return False
 
@@ -3220,15 +3238,6 @@ th{{background:#1a2448}}
             self.post_risk_rebalance_cooldown_until_ts,
             time.time() + max(3.0, self.poll_s * 6.0),
         )
-        self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-        self.risk_sell_settle_gate[side] = {
-            "until": time.time() + 12.0,
-            "target": max(0.0, held - qty),
-            "set_rebuild": 1.0,
-        }
-        self.risk_sell_confirm_wait_until[side] = max(self.risk_sell_confirm_wait_until.get(side, 0.0), time.time() + 12.0)
-        self.risk_sell_next_retry_ts[side] = max(self.risk_sell_next_retry_ts.get(side, 0.0), time.time() + 2.5)
-        self.require_rebuild_after_risk_sell = True
         return True
 
     def _post_risk_rebalance_cooldown_remaining_s(self) -> float:
@@ -3293,9 +3302,8 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
-        allow_completion_discount = "complete bundles" in (note or "").lower()
-        if not self._is_allowed_original_arb_buy_price(price, allow_completion_discount=allow_completion_discount):
-            return False, "price_band_reject"
+        if self._is_original_arb_mode() and not (0.45 <= float(price) <= 0.55):
+            return False, "Original arbitrage mode buy price must be within $0.45-$0.55"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)
@@ -3519,9 +3527,6 @@ th{{background:#1a2448}}
             self.rebalance_only_mode = True
 
     def try_complete_from_inventory(self, books: TopOfBook, pos: PositionSnapshot):
-        if self.require_rebuild_after_risk_sell:
-            self._record_skip("complete:reset_after_risk_sell")
-            return
         if self._post_risk_rebalance_cooldown_remaining_s() > 0:
             self._record_skip("complete:post_risk_rebalance_cooldown")
             return
@@ -3546,7 +3551,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.dn_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask):
                             self._record_skip("complete_down:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
@@ -3576,7 +3581,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.up_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask):
                             self._record_skip("complete_up:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
@@ -5024,10 +5029,7 @@ th{{background:#1a2448}}
         self._last_books = books
         self._fetch_btc_spot(force=self.collect_mode)
         self._sync_market_open_price()
-        prev_pos_snapshot = self.last_positions_snapshot
         pos = self.positions()
-        if self.live:
-            self._reconcile_recent_actions_from_position_delta(prev_pos_snapshot, pos)
         if self.live:
             self._sync_accounting_from_positions(pos)
         else:
@@ -5120,9 +5122,6 @@ th{{background:#1a2448}}
             self.try_flip_scalp(books, pos)
         elif sold_risk:
             decision_lines.append("Executed risk-reducing SELL to cut one-sided exposure; deferring new BUYs this cycle.")
-        elif self.require_rebuild_after_risk_sell:
-            decision_lines.append("Risk-sell reset active: completion buys paused until a new inventory-build buy succeeds.")
-            status_bits.append("Reset-after-risk-sell: build inventory first")
         elif self._post_risk_rebalance_cooldown_remaining_s() > 0:
             rem_cd = int(math.ceil(self._post_risk_rebalance_cooldown_remaining_s()))
             decision_lines.append(
@@ -5926,11 +5925,9 @@ def main():
         price_feed_mode=args.price_feed,
         ws_url=args.ws_url,
     )
-    logger.info("")
     logger.info("================ MARKET START ================")
     logger.info("market_slug=%s question=%s start_utc=%s end_utc=%s", meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
     logger.info("==============================================")
-    logger.info("")
 
     initial_wallet_diag = trader.refresh_wallet_debug(force=True)
     logger.info(
@@ -6004,11 +6001,9 @@ def main():
                     logger.info("Auto-switching to next market because %ss left. from_slug=%s next_slug=%s", tte, prev_slug, next_slug)
                     try:
                         meta = fetch_market_meta(gamma_host, next_slug, logger)
-                        logger.info("")
                         logger.info("================ MARKET SWITCH ===============")
                         logger.info("from_slug=%s to_slug=%s question=%s start_utc=%s end_utc=%s", prev_slug, meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
                         logger.info("==============================================")
-                        logger.info("")
                         trader = Trader(
                             public_client=public_client,
                             authed_client=authed_client,

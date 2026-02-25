@@ -79,6 +79,9 @@ CHAINLINK_BTC_USD_FEED_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.3"
+
 # eth-account (usually installed via py-clob-client deps)
 try:
     from eth_account import Account
@@ -3508,6 +3511,7 @@ th{{background:#1a2448}}
         if ok:
             self._record_purchase(token, px, qty)
             self.spent_est += self.est_effective_cost(px * qty)
+            self.require_rebuild_after_risk_sell = False
 
     def _rpc_json(self, url: str, payload: Dict[str, Any], timeout_s: float = 2.5) -> Optional[Dict[str, Any]]:
         try:
@@ -5188,7 +5192,8 @@ def build_ui(
         Layout(name="decision", ratio=1),
     )
 
-    title = Text("ML Learning (buy-only)" if ml_mode else "Polymarket Inventory-Arb (buy-only)", style="bold")
+    title_base = "ML Learning (buy-only)" if ml_mode else "Polymarket Inventory-Arb (buy-only)"
+    title = Text(f"{title_base} [{BOT_VERSION}]", style="bold")
     display_live = live_mode and (not ml_mode)
     status = Text("LIVE" if display_live else "PAPER", style="bold red" if display_live else "bold green")
     header = Table.grid(expand=True)
@@ -5314,7 +5319,7 @@ def build_ui(
         btc_delta_pct = ((btc_spot_price - btc_open_price) / btc_open_price) * 100.0
         btc_delta_txt = f"{btc_delta_pct:+.3f}%"
     footer = Text(
-        f"Status: {status_bar_text}\n{feed_line} | BTC now/open={'-' if btc_spot_price is None else f'{btc_spot_price:,.2f}'}/{'-' if btc_open_price is None else f'{btc_open_price:,.2f}'} ({btc_delta_txt}, src={btc_price_source}, t={fmt_toronto_hms(btc_last_update_ts)}, open_src={btc_open_source}) | poll_interval={poll_interval_s:.2f}s | log={log_path}",
+        f"Status: {status_bar_text}\nversion={BOT_VERSION} | {feed_line} | BTC now/open={'-' if btc_spot_price is None else f'{btc_spot_price:,.2f}'}/{'-' if btc_open_price is None else f'{btc_open_price:,.2f}'} ({btc_delta_txt}, src={btc_price_source}, t={fmt_toronto_hms(btc_last_update_ts)}, open_src={btc_open_source}) | poll_interval={poll_interval_s:.2f}s | log={log_path}",
         style="dim",
     )
     layout["footer"].update(Align.left(footer))

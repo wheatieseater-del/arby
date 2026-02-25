@@ -80,16 +80,7 @@ CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
-BOT_VERSION = "v2026.02.25.6"
-
-# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
-BOT_VERSION = "v2026.02.25.5"
-
-# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
-BOT_VERSION = "v2026.02.25.4"
-
-# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
-BOT_VERSION = "v2026.02.25.3"
+BOT_VERSION = "v2026.02.25.7"
 
 # eth-account (usually installed via py-clob-client deps)
 try:
@@ -1672,6 +1663,19 @@ class Trader:
         if not hasattr(self, "require_rebuild_after_risk_sell"):
             self.require_rebuild_after_risk_sell = False
 
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
     def remaining_budget(self) -> float:
         return max(0.0, self.max_spend_usd - self.spent_est)
 
@@ -1867,6 +1871,52 @@ class Trader:
             self.logger.info("ACTION ok=%s %s %s shares=%.4f unit=%.4f note=%s", a.ok, a.action, a.side, a.shares, a.unit, a.note)
         else:
             self.logger.warning("ACTION ok=%s %s %s shares=%.4f unit=%.4f note=%s err=%s", a.ok, a.action, a.side, a.shares, a.unit, a.note, a.err)
+
+    def _reconcile_recent_actions_from_position_delta(self, prev_pos: PositionSnapshot, cur_pos: PositionSnapshot):
+        """Mark recent uncertain failed actions as confirmed when position delta proves fill happened."""
+        now_ts = time.time()
+        deltas = {
+            "UP": max(0.0, cur_pos.up.size - prev_pos.up.size),
+            "DOWN": max(0.0, cur_pos.down.size - prev_pos.down.size),
+        }
+        sell_deltas = {
+            "UP": max(0.0, prev_pos.up.size - cur_pos.up.size),
+            "DOWN": max(0.0, prev_pos.down.size - cur_pos.down.size),
+        }
+
+        def _is_uncertain_err(msg: str) -> bool:
+            m = (msg or "").lower()
+            return (
+                "order_not_filled_immediately" in m
+                or "request exception" in m
+                or "status_code=none" in m
+                or "not enough balance" in m
+                or "allowance" in m
+            )
+
+        for action in reversed(self.action_history):
+            if action.ok:
+                continue
+            if (now_ts - float(action.ts_epoch or now_ts)) > 90:
+                break
+            side = (action.side or "").upper()
+            if side not in {"UP", "DOWN"}:
+                continue
+            if action.action.upper() == "BUY" and deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                self.last_success_trade_ts = time.time()
+                deltas[side] = max(0.0, deltas[side] - action.shares)
+                self.logger.info("Action reconciled as filled from position delta; action=BUY side=%s shares=%.4f", side, action.shares)
+            elif action.action.upper() == "SELL" and sell_deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                sell_deltas[side] = max(0.0, sell_deltas[side] - action.shares)
+                self.logger.info("Action reconciled as filled from position delta; action=SELL side=%s shares=%.4f", side, action.shares)
 
     def export_trade_csv(self, out_dir: str, tz_name: str = "America/Toronto") -> Optional[str]:
         try:

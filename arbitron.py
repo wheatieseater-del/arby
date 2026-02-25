@@ -78,10 +78,12 @@ except Exception:  # pragma: no cover
 CHAINLINK_BTC_USD_FEED_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
-TORONTO_TZ = ZoneInfo("America/Toronto")
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
-BOT_VERSION = "v2026.02.25.11"
+BOT_VERSION = "v2026.02.25.8"
+
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.7"
 
 # eth-account (usually installed via py-clob-client deps)
 try:
@@ -96,17 +98,6 @@ except Exception as e:  # pragma: no cover
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-def now_toronto() -> datetime:
-    return datetime.now(TORONTO_TZ)
-
-def fmt_toronto_dt(dt: Optional[datetime]) -> str:
-    if not dt:
-        return "-"
-    try:
-        return dt.astimezone(TORONTO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-    except Exception:
-        return "-"
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -521,7 +512,8 @@ def select_slug_interactive(console: Console, candidates: List[Tuple[str, Option
         tbl.add_column(" ", justify="center", width=3)
         tbl.add_column("Type", justify="center", width=10)
         tbl.add_column("Slug", overflow="fold")
-        tbl.add_column("Start (Toronto)", justify="right")
+        tbl.add_column("Start (local)", justify="right")
+        tbl.add_column("Start (UTC)", justify="right")
 
         for i, (slug, dt_utc) in enumerate(candidates):
             marker = "➤" if i == idx else " "
@@ -532,10 +524,12 @@ def select_slug_interactive(console: Console, candidates: List[Tuple[str, Option
                 label = "(UPCOMING)"
             if dt_utc is None:
                 local_s = "-"
+                utc_s = "-"
             else:
-                local_s = dt_utc.astimezone(TORONTO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                local_s = dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                utc_s = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
             row_style = "bold white on dark_green" if i == idx else ""
-            tbl.add_row(marker, label, slug, local_s, style=row_style)
+            tbl.add_row(marker, label, slug, local_s, utc_s, style=row_style)
 
         help_txt = Text("Use ↑/↓ to move, Enter to select, q to cancel", style="bold cyan")
         console.print(Panel(Group(tbl, Align.center(help_txt)), title="Polymarket Slug Picker", box=box.ROUNDED))
@@ -1438,16 +1432,15 @@ class Trader:
         self.max_session_shares = max(1.0, max_session_shares)
         self.max_trades = max(0, int(max_trades))
         self.market_open_delay_s = max(0, int(market_open_delay_s))
-        # Original arbitrage mode only: force all alternate strategy modes disabled.
-        self.disable_flip_scalp = True
-        self.scalp_only_mode = False
-        self.upswing_only_mode = False
-        self.ml_mode = False
-        self.replication_mode = False
-        self.collect_mode = False
-        self.hedge_only_mode = False
-        self.gpt_mode = False
-        self.fortress_mode = False
+        self.disable_flip_scalp = disable_flip_scalp
+        self.scalp_only_mode = scalp_only_mode
+        self.upswing_only_mode = upswing_only_mode
+        self.ml_mode = ml_mode
+        self.replication_mode = replication_mode
+        self.collect_mode = collect_mode
+        self.hedge_only_mode = hedge_only_mode
+        self.gpt_mode = gpt_mode
+        self.fortress_mode = fortress_mode
         self.gpt_alloc_fraction = clamp(gpt_alloc_fraction, 0.01, 1.0)
         self.gpt_min_signal = clamp(gpt_min_signal, 0.01, 1.0)
         self.fortress_loss_cap = max(0.0, fortress_loss_cap)
@@ -1585,12 +1578,7 @@ class Trader:
         self.pending_pair_unwinds: Dict[str, Dict[str, Any]] = {}
         self.pending_unwind_sell_checks: List[Dict[str, Any]] = []
         self.pending_risk_sell_checks: List[Dict[str, Any]] = []
-        self.risk_sell_side_hold_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        self.risk_sell_settle_gate: Dict[str, Dict[str, float]] = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
-        self.risk_sell_next_retry_ts: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        self.risk_sell_confirm_wait_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
         self.post_risk_rebalance_cooldown_until_ts = 0.0
-        self.require_rebuild_after_risk_sell = False
         self.pair_fill_grace_until_ts = 0.0
         self.next_pending_recheck_ts = 0.0
         self.pending_recheck_interval_s = 2.0
@@ -1662,6 +1650,45 @@ class Trader:
             self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
         if not isinstance(getattr(self, "risk_sell_confirm_wait_until", None), dict):
             self.risk_sell_confirm_wait_until = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
         if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
             self.post_risk_rebalance_cooldown_until_ts = 0.0
         if not hasattr(self, "require_rebuild_after_risk_sell"):
@@ -1912,12 +1939,58 @@ class Trader:
                     self.risk_sell_confirm_wait_until[side] = max(self.risk_sell_confirm_wait_until.get(side, 0.0), time.time() + 12.0)
                 self.logger.info("Action reconciled as filled from position delta; action=SELL side=%s shares=%.4f", side, action.shares)
 
+    def _reconcile_recent_actions_from_position_delta(self, prev_pos: PositionSnapshot, cur_pos: PositionSnapshot):
+        """Mark recent uncertain failed actions as confirmed when position delta proves fill happened."""
+        now_ts = time.time()
+        deltas = {
+            "UP": max(0.0, cur_pos.up.size - prev_pos.up.size),
+            "DOWN": max(0.0, cur_pos.down.size - prev_pos.down.size),
+        }
+        sell_deltas = {
+            "UP": max(0.0, prev_pos.up.size - cur_pos.up.size),
+            "DOWN": max(0.0, prev_pos.down.size - cur_pos.down.size),
+        }
+
+        def _is_uncertain_err(msg: str) -> bool:
+            m = (msg or "").lower()
+            return (
+                "order_not_filled_immediately" in m
+                or "request exception" in m
+                or "status_code=none" in m
+                or "not enough balance" in m
+                or "allowance" in m
+            )
+
+        for action in reversed(self.action_history):
+            if action.ok:
+                continue
+            if (now_ts - float(action.ts_epoch or now_ts)) > 90:
+                break
+            side = (action.side or "").upper()
+            if side not in {"UP", "DOWN"}:
+                continue
+            if action.action.upper() == "BUY" and deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                self.last_success_trade_ts = time.time()
+                deltas[side] = max(0.0, deltas[side] - action.shares)
+                self.logger.info("Action reconciled as filled from position delta; action=BUY side=%s shares=%.4f", side, action.shares)
+            elif action.action.upper() == "SELL" and sell_deltas[side] >= max(0.1, action.shares * 0.5) and _is_uncertain_err(action.err):
+                action.ok = True
+                action.err = ""
+                action.note = f"{action.note} | confirmed filled via position delta"
+                self.executed_trade_count += 1
+                sell_deltas[side] = max(0.0, sell_deltas[side] - action.shares)
+                self.logger.info("Action reconciled as filled from position delta; action=SELL side=%s shares=%.4f", side, action.shares)
+
     def export_trade_csv(self, out_dir: str, tz_name: str = "America/Toronto") -> Optional[str]:
         try:
             export_dir = Path(out_dir)
             export_dir.mkdir(parents=True, exist_ok=True)
             safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", self.meta.slug)
-            stamp = now_toronto().strftime("%Y%m%d_%H%M%S")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             path = export_dir / f"trades_{safe_slug}_{stamp}.csv"
             tz = ZoneInfo(tz_name)
 
@@ -1926,8 +1999,9 @@ class Trader:
                 "market_slug",
                 "market_question",
                 "condition_id",
-                "market_start_toronto",
-                "market_end_toronto",
+                "market_start_utc",
+                "market_end_utc",
+                "action_ts_utc",
                 "action_ts_toronto",
                 "action",
                 "side",
@@ -1962,8 +2036,9 @@ class Trader:
                         self.meta.slug,
                         self.meta.question,
                         self.meta.condition_id,
-                        "" if not self.meta.start_dt_utc else self.meta.start_dt_utc.astimezone(tz).isoformat(),
-                        "" if not self.meta.end_dt_utc else self.meta.end_dt_utc.astimezone(tz).isoformat(),
+                        "" if not self.meta.start_dt_utc else self.meta.start_dt_utc.isoformat(),
+                        "" if not self.meta.end_dt_utc else self.meta.end_dt_utc.isoformat(),
+                        dt_utc.isoformat(),
                         dt_tor.isoformat(),
                         a.action,
                         a.side,
@@ -1995,7 +2070,7 @@ class Trader:
             export_dir.mkdir(parents=True, exist_ok=True)
             safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", self.meta.slug)
             safe_q = re.sub(r"[^a-zA-Z0-9_-]+", "-", (self.meta.question or "market").strip()).strip("-")[:72] or "market"
-            stamp = now_toronto().strftime("%Y%m%d_%H%M%S")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             path = export_dir / f"trades_{safe_slug}_{safe_q}_{stamp}.html"
             tz = ZoneInfo(tz_name)
 
@@ -2090,8 +2165,8 @@ th{{background:#1a2448}}
 <tr><th>Question</th><td>{escape(self.meta.question)}</td></tr>
 <tr><th>Outcomes</th><td>{escape(', '.join(self.meta.outcomes))}</td></tr>
 <tr><th>Interval (s)</th><td>{self.meta.interval_s}</td></tr>
-<tr><th>Start (Toronto)</th><td>{'' if not self.meta.start_dt_utc else escape(self.meta.start_dt_utc.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))}</td></tr>
-<tr><th>End (Toronto)</th><td>{'' if not self.meta.end_dt_utc else escape(self.meta.end_dt_utc.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))}</td></tr>
+<tr><th>Start UTC</th><td>{'' if not self.meta.start_dt_utc else escape(self.meta.start_dt_utc.isoformat())}</td></tr>
+<tr><th>End UTC</th><td>{'' if not self.meta.end_dt_utc else escape(self.meta.end_dt_utc.isoformat())}</td></tr>
 <tr><th>Top of book snapshot</th><td class='mono'>{escape(book_summary)}</td></tr>
 {runtime_rows}
 </table>
@@ -2352,15 +2427,10 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
-    def _is_allowed_original_arb_buy_price(self, price: float, *, allow_completion_discount: bool = False) -> bool:
+    def _is_allowed_original_arb_buy_price(self, price: float) -> bool:
         if not self._is_original_arb_mode():
             return True
-        px = float(price)
-        if 0.45 <= px <= 0.55:
-            return True
-        if allow_completion_discount and px < 0.45:
-            return True
-        return False
+        return 0.45 <= float(price) <= 0.55
 
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
@@ -2484,7 +2554,7 @@ th{{background:#1a2448}}
                 return
             token = self.meta.token_ids[0] if side == "UP" else self.meta.token_ids[1]
             ok, err = self._post_buy(token, ask, qty, f"quant hedge rebalance {side}")
-            ts = now_toronto().strftime("%H:%M:%S")
+            ts = now_utc().astimezone().strftime("%H:%M:%S")
             self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"quant hedge rebalance {side}", ask, ask), ok, err))
             if ok:
                 self._record_purchase(token, ask, qty)
@@ -2524,7 +2594,7 @@ th{{background:#1a2448}}
             return
         token = self.meta.token_ids[0] if side == "UP" else self.meta.token_ids[1]
         ok, err = self._post_buy(token, ask, qty, f"quant hedge upside add {side}")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"quant hedge upside add {side}", ask, ask), ok, err))
         if ok:
             self._record_purchase(token, ask, qty)
@@ -2788,7 +2858,7 @@ th{{background:#1a2448}}
                 keep.append(item)
                 continue
             ok, err = self._post_sell(token_id, sell_px, sell_qty, f"pair unwind remainder {side}")
-            ts = now_toronto().strftime("%H:%M:%S")
+            ts = now_utc().astimezone().strftime("%H:%M:%S")
             retry_action = TradeAction(ts, "SELL", side, sell_qty, sell_px, "pair unwind remainder retry", ok, err)
             self.log_action(retry_action)
             item["last_retry_ts"] = now_ts
@@ -2915,7 +2985,7 @@ th{{background:#1a2448}}
                 self.logger.warning("Failed to cancel unfilled paired leg; pair_id=%s order_id=%s err=%s", pair_id, stuck_order_id, c_err)
 
         ok, err = self._post_sell(token_id, sell_px, qty, f"pair unwind {reason} {unwind_side}")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         note = "pair unwind (other leg not filled after 5s)"
         if reason == "price_drop":
             note = "pair unwind (other leg pending + filled leg dropped >=$0.10)"
@@ -3118,39 +3188,6 @@ th{{background:#1a2448}}
         if any(str(x.get("side") or "") == side for x in self.pending_risk_sell_checks):
             self._record_skip(f"risk_sell:pending:{side}")
             return False
-        now_ts = time.time()
-        if now_ts < float(self.risk_sell_next_retry_ts.get(side, 0.0)):
-            self._record_skip(f"risk_sell:retry_wait:{side}")
-            return False
-
-        settle_gate = self.risk_sell_settle_gate.get(side, {"until": 0.0, "target": 0.0})
-        gate_until = float(settle_gate.get("until") or 0.0)
-        gate_target = max(0.0, float(settle_gate.get("target") or 0.0))
-        if gate_until > 0:
-            if held <= (gate_target + 0.05):
-                if bool(settle_gate.get("set_rebuild")):
-                    self.require_rebuild_after_risk_sell = True
-                    self.post_risk_rebalance_cooldown_until_ts = max(
-                        self.post_risk_rebalance_cooldown_until_ts,
-                        time.time() + max(3.0, self.poll_s * 6.0),
-                    )
-                self.risk_sell_settle_gate[side] = {"until": 0.0, "target": 0.0}
-            elif now_ts < gate_until:
-                self._record_skip(f"risk_sell:settle_wait:{side}")
-                return False
-            else:
-                self.risk_sell_settle_gate[side]["until"] = 0.0
-
-        if now_ts < float(self.risk_sell_confirm_wait_until.get(side, 0.0)):
-            if held <= (gate_target + 0.05):
-                self.risk_sell_confirm_wait_until[side] = 0.0
-            else:
-                self._record_skip(f"risk_sell:confirm_wait:{side}")
-                return False
-
-        if time.time() < float(self.risk_sell_side_hold_until.get(side, 0.0)):
-            self._record_skip(f"risk_sell:side_hold:{side}")
-            return False
 
         pnl_per_share = bid - avg
         panic_mode = pnl_per_share <= -0.10
@@ -3181,7 +3218,7 @@ th{{background:#1a2448}}
             return False
 
         ok, err = self._post_sell(token, sell_px, qty, f"risk rebalance sell {side} ({reason})")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         action = TradeAction(ts, "SELL", side, qty, sell_px, f"risk rebalance sell {side} ({reason})", ok, err)
         self.log_action(action)
         if not ok:
@@ -3190,35 +3227,8 @@ th{{background:#1a2448}}
                 sell_oid = self._extract_order_id_any(err or "")
                 if sell_oid:
                     self._queue_pending_risk_sell_check(side, token, sell_oid, qty, sell_px, reason, action)
-                    self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-                    self.risk_sell_settle_gate[side] = {
-                        "until": time.time() + 12.0,
-                        "target": max(0.0, held - qty),
-                        "set_rebuild": 1.0,
-                    }
                     self._record_skip("risk_sell:pending_recheck")
                     return False
-            low = (err or "").lower()
-            if "not enough balance" in low or "allowance" in low:
-                # A previous sell likely filled and local positions are stale. Pause retries for this side.
-                self.risk_sell_settle_gate[side] = {
-                    "until": time.time() + 12.0,
-                    "target": max(0.0, held - max(0.1, qty * 0.5)),
-                    "set_rebuild": 1.0,
-                }
-                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
-                self._record_skip(f"risk_sell:balance_settle_wait:{side}")
-                return False
-            if "request exception" in low or "status_code=none" in low:
-                # Network-level uncertainty: treat as potentially filled and wait for position settle before retrying.
-                self.risk_sell_settle_gate[side] = {
-                    "until": time.time() + 14.0,
-                    "target": max(0.0, held - max(0.1, qty * 0.5)),
-                    "set_rebuild": 1.0,
-                }
-                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
-                self._record_skip(f"risk_sell:network_settle_wait:{side}")
-                return False
             self._record_skip("risk_sell:failed")
             return False
 
@@ -3228,15 +3238,6 @@ th{{background:#1a2448}}
             self.post_risk_rebalance_cooldown_until_ts,
             time.time() + max(3.0, self.poll_s * 6.0),
         )
-        self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-        self.risk_sell_settle_gate[side] = {
-            "until": time.time() + 12.0,
-            "target": max(0.0, held - qty),
-            "set_rebuild": 1.0,
-        }
-        self.risk_sell_confirm_wait_until[side] = max(self.risk_sell_confirm_wait_until.get(side, 0.0), time.time() + 12.0)
-        self.risk_sell_next_retry_ts[side] = max(self.risk_sell_next_retry_ts.get(side, 0.0), time.time() + 2.5)
-        self.require_rebuild_after_risk_sell = True
         return True
 
     def _post_risk_rebalance_cooldown_remaining_s(self) -> float:
@@ -3301,9 +3302,8 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
-        allow_completion_discount = "complete bundles" in (note or "").lower()
-        if not self._is_allowed_original_arb_buy_price(price, allow_completion_discount=allow_completion_discount):
-            return False, "price_band_reject"
+        if self._is_original_arb_mode() and not (0.45 <= float(price) <= 0.55):
+            return False, "Original arbitrage mode buy price must be within $0.45-$0.55"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)
@@ -3473,7 +3473,7 @@ th{{background:#1a2448}}
         ok1, err1 = self._post_buy(self.meta.token_ids[0], up_buy_px, bundles, "instant bundle")
         ok2, err2 = self._post_buy(self.meta.token_ids[1], dn_buy_px, bundles, "instant bundle")
 
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         a1 = TradeAction(ts, "BUY", "UP", bundles, up_buy_px, self._buy_note("instant bundle", books.up_ask, up_buy_px), ok1, err1)
         a2 = TradeAction(ts, "BUY", "DOWN", bundles, dn_buy_px, self._buy_note("instant bundle", books.dn_ask, dn_buy_px), ok2, err2)
         self.log_action(a1)
@@ -3527,9 +3527,6 @@ th{{background:#1a2448}}
             self.rebalance_only_mode = True
 
     def try_complete_from_inventory(self, books: TopOfBook, pos: PositionSnapshot):
-        if self.require_rebuild_after_risk_sell:
-            self._record_skip("complete:reset_after_risk_sell")
-            return
         if self._post_risk_rebalance_cooldown_remaining_s() > 0:
             self._record_skip("complete:post_risk_rebalance_cooldown")
             return
@@ -3554,11 +3551,11 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.dn_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask):
                             self._record_skip("complete_down:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
-                            ts = now_toronto().strftime("%H:%M:%S")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
                             action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("complete bundles", books.dn_ask, books.dn_ask), ok, err)
                             self.log_action(action)
                             if (not ok) and ("order_not_filled_immediately" in (err or "")):
@@ -3584,11 +3581,11 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.up_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask):
                             self._record_skip("complete_up:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
-                            ts = now_toronto().strftime("%H:%M:%S")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
                             action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("complete bundles", books.up_ask, books.up_ask), ok, err)
                             self.log_action(action)
                             if (not ok) and ("order_not_filled_immediately" in (err or "")):
@@ -3660,7 +3657,7 @@ th{{background:#1a2448}}
             return
 
         ok, err = self._post_buy(token, px, qty, "build inventory")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         action = TradeAction(ts, "BUY", side, qty, px, self._buy_note("build inventory", px, px), ok, err)
         self.log_action(action)
         if (not ok) and ("order_not_filled_immediately" in (err or "")):
@@ -3995,7 +3992,7 @@ th{{background:#1a2448}}
             self._record_skip("gpt:missing_book")
             return
 
-        self._fetch_btc_spot(force=False)
+        self._fetch_btc_spot(force=self.collect_mode)
         mom15 = self._btc_momentum(15.0)
         mom60 = self._btc_momentum(60.0)
 
@@ -4048,7 +4045,7 @@ th{{background:#1a2448}}
             return
 
         ok, err = self._post_buy(token, ask, qty, f"gpt mode buy {side} sig={signal:.3f}")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"gpt mode buy {side} sig={signal:.3f}", ask, ask), ok, err))
         if ok:
             self._record_purchase(token, ask, qty)
@@ -4079,7 +4076,7 @@ th{{background:#1a2448}}
                 if self._can_buy_with_loss_limit(qty, qty, added_paid, self.fortress_loss_cap):
                     ok1, err1 = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "fortress pair lock")
                     ok2, err2 = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "fortress pair lock")
-                    ts = now_toronto().strftime("%H:%M:%S")
+                    ts = now_utc().astimezone().strftime("%H:%M:%S")
                     self.log_action(TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("fortress pair lock", books.up_ask, books.up_ask), ok1, err1))
                     self.log_action(TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("fortress pair lock", books.dn_ask, books.dn_ask), ok2, err2))
                     if ok1:
@@ -4101,7 +4098,7 @@ th{{background:#1a2448}}
             self._record_skip("fortress:imbalance_cap")
             return
 
-        self._fetch_btc_spot(force=False)
+        self._fetch_btc_spot(force=self.collect_mode)
         mom15 = self._btc_momentum(15.0)
         mom60 = self._btc_momentum(60.0)
         directional = clamp((mom15 * 120.0) + (mom60 * 70.0), -1.0, 1.0)
@@ -4129,7 +4126,7 @@ th{{background:#1a2448}}
             return
 
         ok, err = self._post_buy(token, ask, qty, f"fortress tilt {side} sig={directional:.3f}")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"fortress tilt {side} sig={directional:.3f}", ask, ask), ok, err))
         if ok:
             self._record_purchase(token, ask, qty)
@@ -4262,7 +4259,7 @@ th{{background:#1a2448}}
             self._record_skip("flip:min_order_or_budget")
             return
         ok, err = self._post_buy(token, ask, qty, f"flip scalp entry {side} ({signal_note})")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"flip scalp entry {side} ({signal_note})", ask, ask), ok, err))
         if ok:
             self._record_purchase(token, ask, qty)
@@ -4363,7 +4360,7 @@ th{{background:#1a2448}}
             self._record_skip("flip:no_sell_price")
             return
         ok, err = self._post_sell(str(open_pos["token"]), sell_px, qty, f"flip scalp exit {side} ({exit_reason})")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "SELL", side, qty, sell_px, f"flip scalp exit {side} ({exit_reason})", ok, err))
         if not ok:
             low = (err or "").lower()
@@ -4529,7 +4526,7 @@ th{{background:#1a2448}}
             return
 
         ok, err = self._post_buy(token, ask, qty, f"upswing entry {side} ({signal_note})")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, ask, self._buy_note(f"upswing entry {side} ({signal_note})", ask, ask), ok, err))
         if ok:
             self._record_purchase(token, ask, qty)
@@ -4592,7 +4589,7 @@ th{{background:#1a2448}}
             self._record_skip("upswing:no_sell_price")
             return
         ok, err = self._post_sell(str(open_pos["token"]), sell_px, qty, f"upswing exit {side} ({exit_reason})")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "SELL", side, qty, sell_px, f"upswing exit {side} ({exit_reason})", ok, err))
         if not ok:
             self._record_skip("upswing:sell_failed")
@@ -4653,7 +4650,7 @@ th{{background:#1a2448}}
         if books.up_bid is None or books.up_ask is None or books.dn_bid is None or books.dn_ask is None:
             return 0.0, "no_book"
         p = self._ml_strategy_params(idx)
-        self._fetch_btc_spot(force=False)
+        self._fetch_btc_spot(force=self.collect_mode)
         b15 = self._btc_momentum(15.0)
         b45 = self._btc_momentum(45.0)
         btc_sig = clamp((b15 * 180.0) + (b45 * 120.0), -1.0, 1.0)
@@ -4691,7 +4688,7 @@ th{{background:#1a2448}}
         else:
             self.ml_dn_qty += qty
             self.ml_dn_cost += cost
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", side, qty, px, note, True, ""))
         return True
 
@@ -4766,11 +4763,11 @@ th{{background:#1a2448}}
             exists = pth.exists()
             t_now = now_utc()
             row = {
-                "ts_toronto": t_now.astimezone(TORONTO_TZ).isoformat(),
+                "ts_utc": t_now.isoformat(),
                 "market_name": self.meta.question,
                 "slug": self.meta.slug,
-                "market_start_toronto": "" if not self.meta.start_dt_utc else self.meta.start_dt_utc.astimezone(TORONTO_TZ).isoformat(),
-                "market_end_toronto": "" if not self.meta.end_dt_utc else self.meta.end_dt_utc.astimezone(TORONTO_TZ).isoformat(),
+                "market_start_utc": "" if not self.meta.start_dt_utc else self.meta.start_dt_utc.isoformat(),
+                "market_end_utc": "" if not self.meta.end_dt_utc else self.meta.end_dt_utc.isoformat(),
                 "tte_s": self.time_to_end_s(),
                 "up_bid": books.up_bid,
                 "up_ask": books.up_ask,
@@ -4826,7 +4823,7 @@ th{{background:#1a2448}}
             if pth.parent and str(pth.parent) != ".":
                 pth.parent.mkdir(parents=True, exist_ok=True)
             rec = {
-                "ts_toronto": now_toronto().isoformat(),
+                "ts_utc": now_utc().isoformat(),
                 "slug": self.meta.slug,
                 "mode": "replication",
                 "live": self.live,
@@ -4914,7 +4911,7 @@ th{{background:#1a2448}}
                 self._record_skip("repl:rebalance_down_settlement_guard")
                 return
             ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "replication rebalance DOWN")
-            ts = now_toronto().strftime("%H:%M:%S")
+            ts = now_utc().astimezone().strftime("%H:%M:%S")
             action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("replication rebalance DOWN", books.dn_ask, books.dn_ask), ok, err)
             self.log_action(action)
             if ok:
@@ -4938,7 +4935,7 @@ th{{background:#1a2448}}
                 self._record_skip("repl:rebalance_up_settlement_guard")
                 return
             ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "replication rebalance UP")
-            ts = now_toronto().strftime("%H:%M:%S")
+            ts = now_utc().astimezone().strftime("%H:%M:%S")
             action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("replication rebalance UP", books.up_ask, books.up_ask), ok, err)
             self.log_action(action)
             if ok:
@@ -4969,7 +4966,7 @@ th{{background:#1a2448}}
         self.opps_met += 1
         ok1, err1 = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "replication paired buy")
         ok2, err2 = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "replication paired buy")
-        ts = now_toronto().strftime("%H:%M:%S")
+        ts = now_utc().astimezone().strftime("%H:%M:%S")
         self.log_action(TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("replication paired buy", books.up_ask, books.up_ask), ok1, err1))
         self.log_action(TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("replication paired buy", books.dn_ask, books.dn_ask), ok2, err2))
         if ok1:
@@ -5030,18 +5027,17 @@ th{{background:#1a2448}}
         self.session_bought_shares = self._current_market_session_bought_shares()
         books = self.fetch_books()
         self._last_books = books
-        self._fetch_btc_spot(force=False)
+        self._fetch_btc_spot(force=self.collect_mode)
         self._sync_market_open_price()
-        prev_pos_snapshot = self.last_positions_snapshot
         pos = self.positions()
-        if self.live:
-            self._reconcile_recent_actions_from_position_delta(prev_pos_snapshot, pos)
         if self.live:
             self._sync_accounting_from_positions(pos)
         else:
             pos = self._paper_position_snapshot()
             self.positions_stale = False
         pos_guard = self._risk_guard_snapshot(pos)
+        if self.ml_mode:
+            self.spent_est = max(0.0, self.max_spend_usd - self.ml_virtual_cash)
         wallet_debug = self.refresh_wallet_debug()
         portfolio_api = self.refresh_portfolio_value_api(force=False)
         portfolio_balance_now = portfolio_api if portfolio_api is not None else self._portfolio_balance(books, pos, wallet_debug)
@@ -5074,7 +5070,10 @@ th{{background:#1a2448}}
         risky_imbalance = self._has_risky_imbalance(pos_guard)
         status_bits: List[str] = []
         hold_risk_sells = (
-            bool(self.pending_fill_checks)
+            self.ml_mode
+            or self.replication_mode
+            or self.collect_mode
+            or bool(self.pending_fill_checks)
             or bool(self.pending_unwind_sell_checks)
             or bool(self.pending_risk_sell_checks)
             or (time.time() < self.pair_fill_grace_until_ts)
@@ -5115,21 +5114,47 @@ th{{background:#1a2448}}
             self._record_skip("step:positions_stale")
             decision_lines.append("Safety hold: positions API is stale/unreachable; blocking new BUYs to prevent overexposure.")
             status_bits.append("Positions stale: holding new entries")
+            self.try_flip_scalp(books, pos)
         elif self._has_unresolved_exit_risk() and self.live:
             self._record_skip("step:exit_risk_hold")
             decision_lines.append("Safety hold: unresolved SELL failures detected; pausing new BUYs until exits recover.")
             status_bits.append("Exit failures active: no new buys")
+            self.try_flip_scalp(books, pos)
         elif sold_risk:
             decision_lines.append("Executed risk-reducing SELL to cut one-sided exposure; deferring new BUYs this cycle.")
-        elif self.require_rebuild_after_risk_sell:
-            decision_lines.append("Risk-sell reset active: completion buys paused until a new inventory-build buy succeeds.")
-            status_bits.append("Reset-after-risk-sell: build inventory first")
         elif self._post_risk_rebalance_cooldown_remaining_s() > 0:
             rem_cd = int(math.ceil(self._post_risk_rebalance_cooldown_remaining_s()))
             decision_lines.append(
                 f"Post-risk-sell cooldown active ({rem_cd}s): skipping completion buys to avoid acting on stale inventory snapshots."
             )
             status_bits.append(f"Post-risk-sell completion cooldown {rem_cd}s")
+        elif self.scalp_only_mode:
+            status_bits.append("Penny scalping mode: watching oscillation pattern for +$0.01 exits")
+            self.try_flip_scalp(books, pos)
+        elif self.upswing_only_mode:
+            status_bits.append("Upswing scalper mode: buying momentum and exiting at TP/SL")
+            self.try_upswing_scalp(books, pos)
+        elif self.collect_mode:
+            status_bits.append("Collect mode: recording market + BTC snapshots (no trading)")
+            self._collect_market_sample(books)
+        elif self.replication_mode:
+            status_bits.append("Replication mode: late-window paired buys with 4s cadence + bounded imbalance")
+            self.try_replication_mode(books, pos)
+        elif self.ml_mode:
+            status_bits.append("ML lab mode: buy-only adaptive paper strategy search")
+            self.try_ml_mode(books, pos)
+        elif self.hedge_only_mode:
+            status_bits.append("Quant hedge mode: protecting draw floor and adding selective upside")
+            self._update_flip_history(books)
+            self.try_quant_hedge(books, runtime_stats)
+        elif self.gpt_mode:
+            status_bits.append("GPT mode: blending BTC momentum + orderbook imbalance")
+            self._update_flip_history(books)
+            self.try_gpt_mode(books, runtime_stats)
+        elif self.fortress_mode:
+            status_bits.append("Fortress mode: buy-only pair lock with bounded directional tilt")
+            self._update_flip_history(books)
+            self.try_fortress_mode(books, pos, runtime_stats)
         elif (self.market_open_wait_remaining_s() or 0) > 0:
             remaining_s = self.market_open_wait_remaining_s() or 0
             self._record_skip("step:post_open_wait")
@@ -5144,11 +5169,13 @@ th{{background:#1a2448}}
             )
             status_bits.append(f"Rebalancing exposure (net {net_imbalance:+.2f} shares)")
             self.try_complete_from_inventory(books, pos_guard)
+            self.try_flip_scalp(books, pos_guard)
         else:
             status_bits.append("Scanning for instant bundle + completion opportunities")
             self.try_complete_from_inventory(books, pos_guard)
             self.try_instant_bundle(books, pos_guard)
             self.try_build_inventory(books, pos_guard)
+            self.try_flip_scalp(books, pos_guard)
 
         # Build decision text
         if books.up_ask is not None and books.dn_ask is not None:
@@ -5173,7 +5200,7 @@ th{{background:#1a2448}}
         budget = self.remaining_budget()
         decision_lines.append(f"Remaining budget: {budget:.4f} (spent est: {self.spent_est:.4f})")
         decision_lines.append(f"Held-cost floor applied: up_paid={self.up_paid_total:.4f} down_paid={self.down_paid_total:.4f}")
-        decision_lines.append("Max spend source: wallet live balance" if self.live else "Max spend source: configured paper budget")
+        decision_lines.append("Max spend source: ml fixed budget" if self.ml_mode else ("Max spend source: wallet live balance" if self.live else "Max spend source: configured paper budget"))
         eff_edge = self.effective_min_edge()
         idle_s = int(max(0.0, time.time() - self.last_success_trade_ts))
         decision_lines.append(f"Fee rate: {self.meta.taker_fee_rate*100:.4f}% (raw {self.fee_rate_raw}, bps-field {self.fee_rate_bps})  tick_size: {self.meta.tick_size:g}")
@@ -5184,22 +5211,70 @@ th{{background:#1a2448}}
             f"Trade cap: used={self.executed_trade_count} / max={'∞' if rem_trades is None else self.max_trades} (includes buys+sells)"
         )
         decision_lines.append(f"Post-open wait setting: {self.market_open_delay_s}s")
+        if not self.disable_flip_scalp or self.scalp_only_mode:
+            decision_lines.append(
+                f"Flip scalp: enabled={not self.disable_flip_scalp} open_positions={len(self.flip_open)} "
+                f"target_move=+{self.flip_target_cents:.3f} stop_loss=-{self.flip_stop_loss_cents:.2f} "
+                f"spread_cap<={self.flip_max_spread:.3f} min_edge={self.flip_min_expected_edge:.4f} "
+                f"entry_band=[{self.flip_entry_price_min:.2f},{self.flip_entry_price_max:.2f}] max_drift<={self.flip_max_window_drift:.3f} "
+                f"pause_s={(max(0.0, self.flip_pause_until_ts - time.time())):.0f} "
+                f"hold_hedged_pairs={self.flip_hold_hedged_pairs} hold_edge>={self.flip_hold_min_edge:.3f} reserve_qty={self.flip_hedge_reserve_qty:.2f} "
+                f"signal(up/down)={self.flip_signal_debug.get('UP','-')} / {self.flip_signal_debug.get('DOWN','-')}"
+            )
+        if self.upswing_only_mode:
+            decision_lines.append(
+                f"Upswing scalp: open_positions={len(self.upswing_open)} tp=+{self.upswing_take_profit_cents:.3f} sl=-{self.upswing_stop_loss_cents:.3f} min_momo={self.upswing_min_momentum_cents:.3f} min_score={self.upswing_min_score:.2f} signal(up/down)={self.upswing_signal_debug.get('UP','-')} / {self.upswing_signal_debug.get('DOWN','-')}"
+            )
+        if self.ml_mode:
+            decision_lines.append(
+                f"ML lab (paper buy-only): cash={self.ml_virtual_cash:.4f} equity={self._ml_equity_mark(books):.4f} up={self.ml_up_qty:.4f}@{(self.ml_up_cost/max(1e-9,self.ml_up_qty)) if self.ml_up_qty>0 else 0.0:.4f} down={self.ml_dn_qty:.4f}@{(self.ml_dn_cost/max(1e-9,self.ml_dn_qty)) if self.ml_dn_qty>0 else 0.0:.4f} active={self.ml_active_idx} scores={self.ml_scores} trials={self.ml_trials} signal={self.ml_last_signal}"
+            )
+        if self.replication_mode:
+            decision_lines.append(
+                f"Replication: window<={self.replication_window_s:.0f}s cadence={self.replication_cadence_s:.1f}s min_set_edge={self.replication_min_set_edge:.4f} max_net_imbalance={self.replication_max_net_imbalance:.2f} last_set_edge={self.replication_last_set_edge:.4f}"
+            )
         pending_pair_count = sum(1 for p in self.pending_pair_unwinds.values() if (not p.get("unwound")) and (not p.get("resolved")))
         decision_lines.append(f"Pair unwind watch (5s one-leg timeout): pending_pairs={pending_pair_count}")
         decision_lines.append(f"Pair unwind sell rechecks: {len(self.pending_unwind_sell_checks)}")
         decision_lines.append(f"Pair fill grace (risk-sell pause): {max(0.0, self.pair_fill_grace_until_ts - time.time()):.1f}s")
-        decision_lines.append("Strategy mode: original_arbitrage")
-        decision_lines.append(f"Edge target: base={self.min_edge:.6f} effective={eff_edge:.6f} floor={self.min_edge_floor:.6f} idle_since_buy={idle_s}s")
-        decision_lines.append(f"Inventory build enabled: {self.allow_inventory_build}")
+        if self.collect_mode:
+            decision_lines.append(f"Collect mode: csv={self.collect_data_csv} samples={self.collect_samples_count}")
+        if self.replication_mode:
+            tte_dbg = self.time_to_end_s()
+            dyn_edge_dbg = self._replication_dynamic_min_edge(tte_dbg)
+            decision_lines.append(f"Replication dynamic min edge now={dyn_edge_dbg:.4f} (tte={tte_dbg})")
+            decision_lines.append(f"Replication diag log: {self.replication_diag_log}")
+        if self.flip_open and (not self.disable_flip_scalp or self.scalp_only_mode):
+            decision_lines.append(
+                f"Flip exit retry: up_fail={self.flip_exit_fail_count.get('UP',0)} down_fail={self.flip_exit_fail_count.get('DOWN',0)}"
+            )
+        decision_lines.append(f"Strategy mode: {'penny_scalp' if self.scalp_only_mode else ('quant_hedge' if self.hedge_only_mode else ('gpt_mode' if self.gpt_mode else ('fortress' if self.fortress_mode else ('upswing_scalper' if self.upswing_only_mode else ('collect' if self.collect_mode else ('replication' if self.replication_mode else ('ml_lab' if self.ml_mode else 'original_arbitrage')))))))}")
+        if not self.ml_mode:
+            decision_lines.append(f"Edge target: base={self.min_edge:.6f} effective={eff_edge:.6f} floor={self.min_edge_floor:.6f} idle_since_buy={idle_s}s")
+        if (not self.ml_mode) and (not self.collect_mode):
+            decision_lines.append(f"Inventory build enabled: {self.allow_inventory_build}")
         decision_lines.append(f"Execution mode: buy_order_type={self.order_type} sell_order_type={self.sell_order_type} require_immediate_fill={self.require_immediate_fill}")
         decision_lines.append(f"Sell price mode: {self.sell_price_mode} undercut={self.sell_undercut_cents:.3f}")
-        decision_lines.append(
-            f"Risk guard: max_net_imbalance_shares={self.max_net_imbalance_shares:g} net_imbalance_now={net_imbalance:.4f} rebalance_only={self.rebalance_only_mode}"
-        )
-        decision_lines.append(
-            f"Inventory sell guard: max_side={self.max_side_position_shares:.2f} take_profit>={self.inventory_take_profit_cents:.3f} stop_loss<={-self.inventory_stop_loss_cents:.3f}"
-        )
+        if not self.ml_mode:
+            decision_lines.append(
+                f"Risk guard: max_net_imbalance_shares={self.max_net_imbalance_shares:g} net_imbalance_now={net_imbalance:.4f} rebalance_only={self.rebalance_only_mode}"
+            )
+            decision_lines.append(
+                f"Inventory sell guard: max_side={self.max_side_position_shares:.2f} take_profit>={self.inventory_take_profit_cents:.3f} stop_loss<={-self.inventory_stop_loss_cents:.3f}"
+            )
         decision_lines.append(f"Settlement guard: floor={self.settle_floor:.4f} up_if_win={runtime_stats.pnl_if_up_wins:.4f} down_if_win={runtime_stats.pnl_if_down_wins:.4f}")
+        if self.hedge_only_mode:
+            decision_lines.append(
+                f"Hedge guard: minor_loss_limit={self.hedge_minor_loss_limit:.4f} upside_alloc={self.hedge_upside_allocation:.2f} max_upside_shares={self.hedge_max_extra_shares:.2f}"
+            )
+        if self.gpt_mode:
+            decision_lines.append(
+                f"GPT mode: alloc_frac={self.gpt_alloc_fraction:.2f} min_signal={self.gpt_min_signal:.2f} last={self.gpt_last_signal}"
+            )
+        if self.fortress_mode:
+            decision_lines.append(
+                f"Fortress: loss_cap={self.fortress_loss_cap:.3f} lock_edge>={self.fortress_lock_edge:.3f} tilt_budget={self.fortress_tilt_budget:.2f} max_imb={self.fortress_max_imbalance:.2f} max_tilt={self.fortress_max_tilt_shares:.2f}"
+            )
         decision_lines.append(f"BTC spot (Binance WS + fast exchange fallback): now={'-' if self._last_btc_price is None else f'{self._last_btc_price:,.2f}'} open={'-' if self.btc_market_open_price is None else f'{self.btc_market_open_price:,.2f}'} source={self.btc_price_source} at={fmt_toronto_hms(self._last_btc_server_ts)} open_source={self.btc_market_open_source} chainlink_stale_after={self.chainlink_stale_after_s:.1f}s low_latency_mode={self.btc_low_latency_mode} ws_pref={self.btc_prefer_ws} btc_ws_age={(-1 if self.btc_ws_last_update_ts<=0 else (time.time()-self.btc_ws_last_update_ts)):.2f}s")
         decision_lines.append(f"Wallet diag: status={wallet_debug.status} usdc={wallet_debug.balance if wallet_debug.balance is not None else '-'} matic={wallet_debug.matic if wallet_debug.matic is not None else '-'} detail={wallet_debug.detail}")
         decision_lines.append(f"Portfolio balance: {portfolio_balance_now:.4f} delta={portfolio_delta_now:+.4f} source={'api' if portfolio_api is not None else 'mark'}")
@@ -5273,8 +5348,9 @@ def build_ui(
         Layout(name="decision", ratio=1),
     )
 
-    title = Text(f"Polymarket Inventory-Arb (buy-only) [{BOT_VERSION}]", style="bold")
-    display_live = live_mode
+    title_base = "ML Learning (buy-only)" if ml_mode else "Polymarket Inventory-Arb (buy-only)"
+    title = Text(f"{title_base} [{BOT_VERSION}]", style="bold")
+    display_live = live_mode and (not ml_mode)
     status = Text("LIVE" if display_live else "PAPER", style="bold red" if display_live else "bold green")
     header = Table.grid(expand=True)
     header.add_column(justify="left")
@@ -5333,9 +5409,18 @@ def build_ui(
     acct.add_row("Portfolio balance", f"{fmt_money(portfolio_balance_value)} {delta_style}({portfolio_delta_value:+.4f}){delta_suffix}")
     acct.add_row("Spent (est.)", fmt_money(spent))
     acct.add_row("Remaining budget", fmt_money(max(0.0, max_spend - spent)))
+    if ml_mode:
+        ml_pnl = ml_equity - max_spend
+        ml_pnl_pct = (ml_pnl / max_spend * 100.0) if max_spend > 0 else 0.0
+        acct.add_row("ML equity (mark)", fmt_money(ml_equity))
+        acct.add_row("ML PnL (mark)", f"{ml_pnl:+.4f} ({ml_pnl_pct:+.2f}%)")
     acct.add_row("Bundles hedged", f"{pos.hedged:.4f}")
-    acct.add_row("Held UP shares @ avg", f"{pos.up.size:.4f} @ {pos.up.avg_price:.4f}")
-    acct.add_row("Held DOWN shares @ avg", f"{pos.down.size:.4f} @ {pos.down.avg_price:.4f}")
+    if ml_mode:
+        acct.add_row("Held UP shares @ avg", f"{ml_up_qty:.4f} @ {ml_up_avg:.4f}")
+        acct.add_row("Held DOWN shares @ avg", f"{ml_dn_qty:.4f} @ {ml_dn_avg:.4f}")
+    else:
+        acct.add_row("Held UP shares @ avg", f"{pos.up.size:.4f} @ {pos.up.avg_price:.4f}")
+        acct.add_row("Held DOWN shares @ avg", f"{pos.down.size:.4f} @ {pos.down.avg_price:.4f}")
     acct.add_row("Unhedged Up", f"{pos.unhedged_up:.4f}")
     acct.add_row("Unhedged Down", f"{pos.unhedged_down:.4f}")
     acct.add_row("Opps met (trades)", str(opps_met))
@@ -5436,18 +5521,11 @@ def pressed_key_action() -> Optional[str]:
 # Main
 # ----------------------------
 
-class TorontoFormatter(logging.Formatter):
-    def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=TORONTO_TZ)
-        if datefmt:
-            return dt.strftime(datefmt)
-        return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-
 def setup_logger(log_path: str) -> logging.Logger:
     logger = logging.getLogger("arb")
     logger.setLevel(logging.DEBUG)
 
-    fmt = TorontoFormatter("%(asctime)s %(levelname)s %(message)s")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     fh = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -5646,25 +5724,44 @@ def main():
     logger = setup_logger(args.log)
     console = Console()
 
-    # Original arbitrage mode only.
-    strategy_mode = "arb"
-    scalp_only_mode = False
-    hedge_only_mode = False
-    gpt_mode = False
-    fortress_mode = False
-    upswing_only_mode = False
-    replication_mode = False
-    collect_mode = False
-    ml_mode = False
-    disable_flip_scalp = True
+    strategy_mode = args.strategy_mode
+    if strategy_mode == "auto":
+        if sys.stdin.isatty():
+            picked = select_strategy_mode_interactive(console)
+            strategy_mode = picked or "arb"
+        else:
+            strategy_mode = "arb"
+    scalp_only_mode = strategy_mode == "scalp"
+    hedge_only_mode = strategy_mode == "hedge"
+    gpt_mode = strategy_mode == "gpt"
+    fortress_mode = strategy_mode == "fortress"
+    upswing_only_mode = strategy_mode == "upswing"
+    replication_mode = strategy_mode == "replicate"
+    collect_mode = strategy_mode == "collect"
+    ml_mode = strategy_mode == "ml"
+    if ml_mode:
+        args.max_spend = 200.0
+    if collect_mode and args.price_feed != "ws":
+        args.price_feed = "ws"
+    disable_flip_scalp = args.disable_flip_scalp or (strategy_mode in {"arb", "hedge", "gpt", "fortress", "upswing", "ml", "replicate", "collect"})
+    if scalp_only_mode and sys.stdin.isatty():
+        select_scalp_settings_interactive(console, args)
     selected_market_symbol: Optional[str] = None
-    if sys.stdin.isatty():
+    if strategy_mode == "arb" and sys.stdin.isatty():
         select_arb_settings_interactive(console, args)
         selected_market_symbol = select_market_symbol_interactive(console)
         os.environ["MAX_NET_IMBALANCE_SHARES"] = str(args.max_net_imbalance_shares)
         if args.aggressive_edge_relax:
             os.environ["EDGE_RELAX_AFTER_S"] = "45"
             os.environ["MIN_EDGE_FLOOR"] = "0.0005"
+    if upswing_only_mode and sys.stdin.isatty():
+        select_upswing_settings_interactive(console, args)
+    if hedge_only_mode and sys.stdin.isatty():
+        select_hedge_settings_interactive(console, args)
+    if gpt_mode and sys.stdin.isatty():
+        select_gpt_settings_interactive(console, args)
+    if fortress_mode and sys.stdin.isatty():
+        select_fortress_settings_interactive(console, args)
 
     # Hosts
     clob_host = os.getenv("CLOB_HOST") or os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
@@ -5722,7 +5819,7 @@ def main():
 
     logger.info("START slug=%s live=%s max_spend=%.4f poll=%.2f chain_id=%s signature_type=%s auth_mode=%s funder=%s market_universe=%s market_selection=%s",
                 selected_slug, live_mode, args.max_spend, args.poll, chain_id, signature_type, auth_mode, funder, args.market_universe, args.market_selection)
-    logger.info("STRATEGY mode=arb (original arbitrage only)")
+    logger.info("STRATEGY mode=%s scalp_only=%s upswing_only=%s replication_mode=%s collect_mode=%s ml_mode=%s hedge_only=%s gpt_mode=%s fortress_mode=%s flip_scalp_enabled=%s", strategy_mode, scalp_only_mode, upswing_only_mode, replication_mode, collect_mode, ml_mode, hedge_only_mode, gpt_mode, fortress_mode, not disable_flip_scalp)
 
     # Market meta
     try:
@@ -5828,11 +5925,9 @@ def main():
         price_feed_mode=args.price_feed,
         ws_url=args.ws_url,
     )
-    logger.info("")
     logger.info("================ MARKET START ================")
-    logger.info("market_slug=%s question=%s start_toronto=%s end_toronto=%s", meta.slug, meta.question, fmt_toronto_dt(meta.start_dt_utc), fmt_toronto_dt(meta.end_dt_utc))
+    logger.info("market_slug=%s question=%s start_utc=%s end_utc=%s", meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
     logger.info("==============================================")
-    logger.info("")
 
     initial_wallet_diag = trader.refresh_wallet_debug(force=True)
     logger.info(
@@ -5906,11 +6001,9 @@ def main():
                     logger.info("Auto-switching to next market because %ss left. from_slug=%s next_slug=%s", tte, prev_slug, next_slug)
                     try:
                         meta = fetch_market_meta(gamma_host, next_slug, logger)
-                        logger.info("")
                         logger.info("================ MARKET SWITCH ===============")
-                        logger.info("from_slug=%s to_slug=%s question=%s start_toronto=%s end_toronto=%s", prev_slug, meta.slug, meta.question, fmt_toronto_dt(meta.start_dt_utc), fmt_toronto_dt(meta.end_dt_utc))
+                        logger.info("from_slug=%s to_slug=%s question=%s start_utc=%s end_utc=%s", prev_slug, meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
                         logger.info("==============================================")
-                        logger.info("")
                         trader = Trader(
                             public_client=public_client,
                             authed_client=authed_client,
@@ -6014,12 +6107,12 @@ def main():
                     wallet_balance_value=wallet_debug.balance,
                     portfolio_balance_value=((trader.portfolio_api_value if trader.portfolio_api_value is not None else trader._portfolio_balance(books, pos, wallet_debug))),
                     portfolio_delta_value=(((trader.portfolio_api_value if trader.portfolio_api_value is not None else trader._portfolio_balance(books, pos, wallet_debug)) - (trader.portfolio_start_balance or (trader.portfolio_api_value if trader.portfolio_api_value is not None else trader._portfolio_balance(books, pos, wallet_debug))))),
-                    ml_mode=False,
-                    ml_up_qty=0.0,
-                    ml_dn_qty=0.0,
-                    ml_up_avg=0.0,
-                    ml_dn_avg=0.0,
-                    ml_equity=0.0,
+                    ml_mode=ml_mode,
+                    ml_up_qty=trader.ml_up_qty,
+                    ml_dn_qty=trader.ml_dn_qty,
+                    ml_up_avg=(trader.ml_up_cost / max(1e-9, trader.ml_up_qty) if trader.ml_up_qty > 0 else 0.0),
+                    ml_dn_avg=(trader.ml_dn_cost / max(1e-9, trader.ml_dn_qty) if trader.ml_dn_qty > 0 else 0.0),
+                    ml_equity=trader._ml_equity_mark(books),
                     html_reports=(generated_html_reports if generated_html_reports else trader.generated_html_reports),
                     live_mode=live_mode,
                     signer_addr=signer_addr,

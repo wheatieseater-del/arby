@@ -3126,8 +3126,8 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
-        if not self._is_allowed_original_arb_buy_price(price):
-            return False, "price_band_reject"
+        if self._is_original_arb_mode() and not (0.45 <= float(price) <= 0.55):
+            return False, "Original arbitrage mode buy price must be within $0.45-$0.55"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)

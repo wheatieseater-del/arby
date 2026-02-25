@@ -2758,7 +2758,7 @@ th{{background:#1a2448}}
             self.paper_dn_qty = held - sold
             self.paper_dn_cost = max(0.0, self.paper_dn_cost - (avg * sold))
 
-    def _attempt_pair_unwind(self, pair_id: str):
+    def _attempt_pair_unwind(self, pair_id: str, *, reason: str = "timeout", fast_exit: bool = False):
         if not self._is_original_arb_mode():
             return
         pair = self.pending_pair_unwinds.get(pair_id)
@@ -2796,7 +2796,11 @@ th{{background:#1a2448}}
         books = self._last_books
         bid = books.up_bid if (books and unwind_side == "UP") else (books.dn_bid if books else None)
         ask = books.up_ask if (books and unwind_side == "UP") else (books.dn_ask if books else None)
-        sell_px = self._sell_limit_price(bid, ask)
+        if fast_exit and bid is not None:
+            tick = max(0.001, self.meta.tick_size)
+            sell_px = max(tick, min(0.999, math.floor(bid / tick) * tick))
+        else:
+            sell_px = self._sell_limit_price(bid, ask)
         if sell_px is None:
             self._record_skip(f"pair_unwind:no_price:{unwind_side}")
             return
@@ -2824,9 +2828,12 @@ th{{background:#1a2448}}
             else:
                 self.logger.warning("Failed to cancel unfilled paired leg; pair_id=%s order_id=%s err=%s", pair_id, stuck_order_id, c_err)
 
-        ok, err = self._post_sell(token_id, sell_px, qty, f"pair unwind timeout {unwind_side}")
+        ok, err = self._post_sell(token_id, sell_px, qty, f"pair unwind {reason} {unwind_side}")
         ts = now_utc().astimezone().strftime("%H:%M:%S")
-        unwind_action = TradeAction(ts, "SELL", unwind_side, qty, sell_px, "pair unwind (other leg not filled after 5s)", ok, err)
+        note = "pair unwind (other leg not filled after 5s)"
+        if reason == "price_drop":
+            note = "pair unwind (other leg pending + filled leg dropped >=$0.10)"
+        unwind_action = TradeAction(ts, "SELL", unwind_side, qty, sell_px, note, ok, err)
         self.log_action(unwind_action)
         if ok:
             pair["unwound"] = True
@@ -2839,9 +2846,33 @@ th{{background:#1a2448}}
         else:
             pair["next_unwind_try_ts"] = now_ts + 8.0
         if ok:
-            self.logger.info("Executed pair unwind sell after timeout; pair_id=%s side=%s qty=%.4f px=%.4f", pair_id, unwind_side, qty, sell_px)
+            self.logger.info("Executed pair unwind sell; pair_id=%s reason=%s side=%s qty=%.4f px=%.4f", pair_id, reason, unwind_side, qty, sell_px)
         else:
-            self.logger.warning("Pair unwind sell failed; pair_id=%s side=%s err=%s", pair_id, unwind_side, err)
+            self.logger.warning("Pair unwind sell failed; pair_id=%s reason=%s side=%s err=%s", pair_id, reason, unwind_side, err)
+
+    def _pair_unwind_price_drop_trigger(self, pair: Dict[str, Any]) -> Optional[Tuple[str, float, float]]:
+        up = pair.get("UP") or {}
+        dn = pair.get("DOWN") or {}
+        if bool(up.get("filled")) == bool(dn.get("filled")):
+            return None
+
+        side = "UP" if bool(up.get("filled")) else "DOWN"
+        leg = up if side == "UP" else dn
+        entry = max(0.0, float(leg.get("price") or 0.0))
+        if entry <= 0:
+            return None
+
+        books = self._last_books
+        bid = books.up_bid if (books and side == "UP") else (books.dn_bid if books else None)
+        ask = books.up_ask if (books and side == "UP") else (books.dn_ask if books else None)
+        mark = bid if bid is not None else ask
+        if mark is None:
+            return None
+
+        drop = entry - float(mark)
+        if drop >= 0.10:
+            return side, entry, float(mark)
+        return None
 
     def _recheck_pending_fills(self):
         if (not self.pending_fill_checks) and (not self.pending_pair_unwinds) and (not self.pending_unwind_sell_checks) and (not self.pending_risk_sell_checks):
@@ -2911,6 +2942,20 @@ th{{background:#1a2448}}
             if pair.get("unwound"):
                 if (now_ts - float(pair.get("created_ts") or now_ts)) > 120:
                     self.pending_pair_unwinds.pop(pair_id, None)
+                continue
+            drop_trigger = self._pair_unwind_price_drop_trigger(pair)
+            if drop_trigger is not None:
+                side, entry, mark = drop_trigger
+                if not pair.get("price_drop_triggered"):
+                    pair["price_drop_triggered"] = True
+                    self.logger.warning(
+                        "Pair unwind emergency trigger: filled side %s dropped >=$0.10 while opposite leg pending; pair_id=%s entry=%.4f mark=%.4f",
+                        side,
+                        pair_id,
+                        entry,
+                        mark,
+                    )
+                self._attempt_pair_unwind(pair_id, reason="price_drop", fast_exit=True)
                 continue
             age = now_ts - float(pair.get("created_ts") or now_ts)
             if age < 5.0:

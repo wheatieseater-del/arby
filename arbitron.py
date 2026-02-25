@@ -80,6 +80,9 @@ CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.6"
+
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
 BOT_VERSION = "v2026.02.25.5"
 
 # BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
@@ -1642,6 +1645,19 @@ class Trader:
         self.btc_fetch_min_interval_s = max(0.02, parse_floatish(os.getenv("BTC_FETCH_MIN_INTERVAL_S"), 0.2))
         if self.collect_mode:
             self.btc_fetch_min_interval_s = min(self.btc_fetch_min_interval_s, 0.05)
+
+    def _ensure_runtime_guards(self) -> None:
+        """Backfill newer runtime guard attrs for older live objects/configs."""
+        if not isinstance(getattr(self, "risk_sell_side_hold_until", None), dict):
+            self.risk_sell_side_hold_until = {"UP": 0.0, "DOWN": 0.0}
+        if not isinstance(getattr(self, "risk_sell_settle_gate", None), dict):
+            self.risk_sell_settle_gate = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        if not isinstance(getattr(self, "risk_sell_next_retry_ts", None), dict):
+            self.risk_sell_next_retry_ts = {"UP": 0.0, "DOWN": 0.0}
+        if not hasattr(self, "post_risk_rebalance_cooldown_until_ts"):
+            self.post_risk_rebalance_cooldown_until_ts = 0.0
+        if not hasattr(self, "require_rebuild_after_risk_sell"):
+            self.require_rebuild_after_risk_sell = False
 
     def _ensure_runtime_guards(self) -> None:
         """Backfill newer runtime guard attrs for older live objects/configs."""

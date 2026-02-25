@@ -5764,6 +5764,9 @@ def main():
         price_feed_mode=args.price_feed,
         ws_url=args.ws_url,
     )
+    logger.info("================ MARKET START ================")
+    logger.info("market_slug=%s question=%s start_utc=%s end_utc=%s", meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
+    logger.info("==============================================")
 
     initial_wallet_diag = trader.refresh_wallet_debug(force=True)
     logger.info(
@@ -5837,6 +5840,9 @@ def main():
                     logger.info("Auto-switching to next market because %ss left. from_slug=%s next_slug=%s", tte, prev_slug, next_slug)
                     try:
                         meta = fetch_market_meta(gamma_host, next_slug, logger)
+                        logger.info("================ MARKET SWITCH ===============")
+                        logger.info("from_slug=%s to_slug=%s question=%s start_utc=%s end_utc=%s", prev_slug, meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
+                        logger.info("==============================================")
                         trader = Trader(
                             public_client=public_client,
                             authed_client=authed_client,

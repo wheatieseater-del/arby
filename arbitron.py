@@ -3033,19 +3033,30 @@ th{{background:#1a2448}}
             return False
 
         pnl_per_share = bid - avg
+        panic_mode = pnl_per_share <= -0.10
         if reason == "imbalance":
             if pnl_per_share < -self.inventory_stop_loss_cents:
                 reason = "imbalance_stop"
             elif pnl_per_share >= self.inventory_take_profit_cents:
                 reason = "imbalance_take"
+        if panic_mode:
+            reason = f"{reason}_panic" if reason else "panic"
 
         sell_px = self._sell_limit_price(bid, ask)
+        if panic_mode and bid is not None:
+            tick = max(0.001, self.meta.tick_size)
+            panic_px = max(tick, min(0.999, bid - 0.01))
+            sell_px = max(tick, math.floor(panic_px / tick) * tick)
         if sell_px is None:
             self._record_skip("risk_sell:no_price")
             return False
         qty_avail = min(held, self._available_qty_for_side(side))
-        qty = min(self.step_shares, qty_avail, bid_sz, max(0.0, qty_need))
-        if qty <= 0 or not self._meets_min_order(sell_px, qty):
+        if panic_mode:
+            qty = min(self.step_shares, qty_avail)
+        else:
+            qty = min(self.step_shares, qty_avail, bid_sz, max(0.0, qty_need))
+        min_ok = ((qty >= 0.1 and (sell_px * qty) >= 0.05) if panic_mode else self._meets_min_order(sell_px, qty))
+        if qty <= 0 or not min_ok:
             self._record_skip("risk_sell:min_order")
             return False
 

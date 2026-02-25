@@ -1572,6 +1572,7 @@ class Trader:
         self.pending_pair_unwinds: Dict[str, Dict[str, Any]] = {}
         self.pending_unwind_sell_checks: List[Dict[str, Any]] = []
         self.pending_risk_sell_checks: List[Dict[str, Any]] = []
+        self.post_risk_rebalance_cooldown_until_ts = 0.0
         self.pair_fill_grace_until_ts = 0.0
         self.next_pending_recheck_ts = 0.0
         self.pending_recheck_interval_s = 2.0
@@ -3076,7 +3077,14 @@ th{{background:#1a2448}}
 
         credit = max(0.0, bid * qty * (1.0 - self.meta.taker_fee_rate))
         self.spent_est = max(0.0, self.spent_est - credit)
+        self.post_risk_rebalance_cooldown_until_ts = max(
+            self.post_risk_rebalance_cooldown_until_ts,
+            time.time() + max(3.0, self.poll_s * 6.0),
+        )
         return True
+
+    def _post_risk_rebalance_cooldown_remaining_s(self) -> float:
+        return max(0.0, self.post_risk_rebalance_cooldown_until_ts - time.time())
 
     def refresh_wallet_debug(self, force: bool = False) -> WalletDebug:
         if (not force) and (time.time() - self._wallet_debug_last_ts < self.wallet_refresh_interval_s):
@@ -3362,6 +3370,9 @@ th{{background:#1a2448}}
             self.rebalance_only_mode = True
 
     def try_complete_from_inventory(self, books: TopOfBook, pos: PositionSnapshot):
+        if self._post_risk_rebalance_cooldown_remaining_s() > 0:
+            self._record_skip("complete:post_risk_rebalance_cooldown")
+            return
         if not self._can_open_new_buy():
             self._record_skip("buy:max_trades")
             return
@@ -4951,6 +4962,12 @@ th{{background:#1a2448}}
             self.try_flip_scalp(books, pos)
         elif sold_risk:
             decision_lines.append("Executed risk-reducing SELL to cut one-sided exposure; deferring new BUYs this cycle.")
+        elif self._post_risk_rebalance_cooldown_remaining_s() > 0:
+            rem_cd = int(math.ceil(self._post_risk_rebalance_cooldown_remaining_s()))
+            decision_lines.append(
+                f"Post-risk-sell cooldown active ({rem_cd}s): skipping completion buys to avoid acting on stale inventory snapshots."
+            )
+            status_bits.append(f"Post-risk-sell completion cooldown {rem_cd}s")
         elif self.scalp_only_mode:
             status_bits.append("Penny scalping mode: watching oscillation pattern for +$0.01 exits")
             self.try_flip_scalp(books, pos)

@@ -1,5 +1,3 @@
-revert to this code but add the rule that  in original arbitrage mode it won't buy for less than .40 or more than .60
-
 #!/usr/bin/env python3
 """
 Polymarket Inventory-Arb (buy-only) — LIVE or PAPER
@@ -80,6 +78,9 @@ except Exception:  # pragma: no cover
 CHAINLINK_BTC_USD_FEED_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 CHAINLINK_LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
 CHAINLINK_DECIMALS_SELECTOR = "0x313ce567"
+
+# BOT_VERSION: update this whenever code changes so runtime and source can be cross-verified.
+BOT_VERSION = "v2026.02.25.3"
 
 # eth-account (usually installed via py-clob-client deps)
 try:
@@ -984,7 +985,11 @@ def select_arb_settings_interactive(console: Console, args: argparse.Namespace) 
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
-    levels = ["Lowest", "Low", "Medium", "High", "Highest"]
+    level_labels_by_count: Dict[int, List[str]] = {
+        4: ["Low", "Medium", "High", "Highest"],
+        5: ["Lowest", "Low", "Medium", "High", "Highest"],
+        6: ["Lowest", "Low", "Medium", "High", "Higher", "Highest"],
+    }
     settings: List[Dict[str, Any]] = [
         {
             "name": "Min edge",
@@ -1003,7 +1008,7 @@ def select_arb_settings_interactive(console: Console, args: argparse.Namespace) 
         {
             "name": "Max session shares",
             "attr": "max_session_shares",
-            "values": [10.0, 15.0, 30.0, 50.0, 80.0],
+            "values": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
             "fmt": lambda v: f"{float(v):.0f}",
             "note": "Total buy shares per market",
         },
@@ -1013,6 +1018,13 @@ def select_arb_settings_interactive(console: Console, args: argparse.Namespace) 
             "values": [80, 40, 0, 0, 0],
             "fmt": lambda v: ("∞" if int(v) == 0 else str(int(v))),
             "note": "0 = unlimited",
+        },
+        {
+            "name": "Post-open wait",
+            "attr": "market_open_delay_s",
+            "values": [5, 10, 15, 30],
+            "fmt": lambda v: f"{int(v)}s",
+            "note": "Wait this long after market open before buying",
         },
         {
             "name": "Allow inventory build",
@@ -1080,7 +1092,8 @@ def select_arb_settings_interactive(console: Console, args: argparse.Namespace) 
             tbl.add_column(" ", width=3, justify="center")
             tbl.add_column("Risk level", justify="left")
             tbl.add_column("Value", justify="left")
-            for i, lvl in enumerate(levels):
+            level_labels = level_labels_by_count.get(len(vals), [f"Option {i+1}" for i in range(len(vals))])
+            for i, lvl in enumerate(level_labels):
                 marker = "➤" if i == idx else " "
                 row_style = "bold white on dark_blue" if i == idx else ""
                 tbl.add_row(marker, lvl, st["fmt"](vals[i]), style=row_style)
@@ -1117,7 +1130,7 @@ def select_arb_settings_interactive(console: Console, args: argparse.Namespace) 
             (
                 f"Applied classic-arb settings:\n"
                 f"min_edge={args.min_edge:.4f} step={args.step:g} max_session_shares={args.max_session_shares:g} "
-                f"max_trades={'∞' if args.max_trades == 0 else args.max_trades} allow_inventory_build={args.allow_inventory_build} "
+                f"max_trades={'∞' if args.max_trades == 0 else args.max_trades} post_open_wait={int(args.market_open_delay_s)}s allow_inventory_build={args.allow_inventory_build} "
                 f"max_net_imbalance={args.max_net_imbalance_shares:g} poll={args.poll:.2f}s aggressive_edge_relax={args.aggressive_edge_relax}\n"
                 f"saved_config={cfg_path}"
             ),
@@ -1359,6 +1372,7 @@ class Trader:
         ws_url: str,
         max_session_shares: float,
         max_trades: int,
+        market_open_delay_s: int,
         disable_flip_scalp: bool,
         scalp_only_mode: bool,
         upswing_only_mode: bool,
@@ -1414,6 +1428,7 @@ class Trader:
         self.settle_floor = settle_floor
         self.max_session_shares = max(1.0, max_session_shares)
         self.max_trades = max(0, int(max_trades))
+        self.market_open_delay_s = max(0, int(market_open_delay_s))
         self.disable_flip_scalp = disable_flip_scalp
         self.scalp_only_mode = scalp_only_mode
         self.upswing_only_mode = upswing_only_mode
@@ -1560,6 +1575,10 @@ class Trader:
         self.pending_pair_unwinds: Dict[str, Dict[str, Any]] = {}
         self.pending_unwind_sell_checks: List[Dict[str, Any]] = []
         self.pending_risk_sell_checks: List[Dict[str, Any]] = []
+        self.risk_sell_side_hold_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
+        self.risk_sell_settle_gate: Dict[str, Dict[str, float]] = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
+        self.post_risk_rebalance_cooldown_until_ts = 0.0
+        self.require_rebuild_after_risk_sell = False
         self.pair_fill_grace_until_ts = 0.0
         self.next_pending_recheck_ts = 0.0
         self.pending_recheck_interval_s = 2.0
@@ -1666,6 +1685,12 @@ class Trader:
         if not self.meta.end_dt_utc:
             return None
         return int((self.meta.end_dt_utc - now_utc()).total_seconds())
+
+    def market_open_wait_remaining_s(self) -> Optional[int]:
+        if (not self.meta.start_dt_utc) or self.market_open_delay_s <= 0:
+            return None
+        unlock_ts = self.meta.start_dt_utc.timestamp() + float(self.market_open_delay_s)
+        return max(0, int(math.ceil(unlock_ts - time.time())))
 
     def _ws_parse_top(self, payload: Any, token_id: str) -> Optional[Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]]:
         if not isinstance(payload, dict):
@@ -2253,6 +2278,16 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
+    def _is_allowed_original_arb_buy_price(self, price: float, *, allow_completion_discount: bool = False) -> bool:
+        if not self._is_original_arb_mode():
+            return True
+        px = float(price)
+        if 0.45 <= px <= 0.55:
+            return True
+        if allow_completion_discount and px < 0.45:
+            return True
+        return False
+
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
             return None
@@ -2735,7 +2770,7 @@ th{{background:#1a2448}}
             self.paper_dn_qty = held - sold
             self.paper_dn_cost = max(0.0, self.paper_dn_cost - (avg * sold))
 
-    def _attempt_pair_unwind(self, pair_id: str):
+    def _attempt_pair_unwind(self, pair_id: str, *, reason: str = "timeout", fast_exit: bool = False):
         if not self._is_original_arb_mode():
             return
         pair = self.pending_pair_unwinds.get(pair_id)
@@ -2773,7 +2808,11 @@ th{{background:#1a2448}}
         books = self._last_books
         bid = books.up_bid if (books and unwind_side == "UP") else (books.dn_bid if books else None)
         ask = books.up_ask if (books and unwind_side == "UP") else (books.dn_ask if books else None)
-        sell_px = self._sell_limit_price(bid, ask)
+        if fast_exit and bid is not None:
+            tick = max(0.001, self.meta.tick_size)
+            sell_px = max(tick, min(0.999, math.floor(bid / tick) * tick))
+        else:
+            sell_px = self._sell_limit_price(bid, ask)
         if sell_px is None:
             self._record_skip(f"pair_unwind:no_price:{unwind_side}")
             return
@@ -2801,9 +2840,12 @@ th{{background:#1a2448}}
             else:
                 self.logger.warning("Failed to cancel unfilled paired leg; pair_id=%s order_id=%s err=%s", pair_id, stuck_order_id, c_err)
 
-        ok, err = self._post_sell(token_id, sell_px, qty, f"pair unwind timeout {unwind_side}")
+        ok, err = self._post_sell(token_id, sell_px, qty, f"pair unwind {reason} {unwind_side}")
         ts = now_utc().astimezone().strftime("%H:%M:%S")
-        unwind_action = TradeAction(ts, "SELL", unwind_side, qty, sell_px, "pair unwind (other leg not filled after 5s)", ok, err)
+        note = "pair unwind (other leg not filled after 5s)"
+        if reason == "price_drop":
+            note = "pair unwind (other leg pending + filled leg dropped >=$0.10)"
+        unwind_action = TradeAction(ts, "SELL", unwind_side, qty, sell_px, note, ok, err)
         self.log_action(unwind_action)
         if ok:
             pair["unwound"] = True
@@ -2816,9 +2858,33 @@ th{{background:#1a2448}}
         else:
             pair["next_unwind_try_ts"] = now_ts + 8.0
         if ok:
-            self.logger.info("Executed pair unwind sell after timeout; pair_id=%s side=%s qty=%.4f px=%.4f", pair_id, unwind_side, qty, sell_px)
+            self.logger.info("Executed pair unwind sell; pair_id=%s reason=%s side=%s qty=%.4f px=%.4f", pair_id, reason, unwind_side, qty, sell_px)
         else:
-            self.logger.warning("Pair unwind sell failed; pair_id=%s side=%s err=%s", pair_id, unwind_side, err)
+            self.logger.warning("Pair unwind sell failed; pair_id=%s reason=%s side=%s err=%s", pair_id, reason, unwind_side, err)
+
+    def _pair_unwind_price_drop_trigger(self, pair: Dict[str, Any]) -> Optional[Tuple[str, float, float]]:
+        up = pair.get("UP") or {}
+        dn = pair.get("DOWN") or {}
+        if bool(up.get("filled")) == bool(dn.get("filled")):
+            return None
+
+        side = "UP" if bool(up.get("filled")) else "DOWN"
+        leg = up if side == "UP" else dn
+        entry = max(0.0, float(leg.get("price") or 0.0))
+        if entry <= 0:
+            return None
+
+        books = self._last_books
+        bid = books.up_bid if (books and side == "UP") else (books.dn_bid if books else None)
+        ask = books.up_ask if (books and side == "UP") else (books.dn_ask if books else None)
+        mark = bid if bid is not None else ask
+        if mark is None:
+            return None
+
+        drop = entry - float(mark)
+        if drop >= 0.10:
+            return side, entry, float(mark)
+        return None
 
     def _recheck_pending_fills(self):
         if (not self.pending_fill_checks) and (not self.pending_pair_unwinds) and (not self.pending_unwind_sell_checks) and (not self.pending_risk_sell_checks):
@@ -2888,6 +2954,20 @@ th{{background:#1a2448}}
             if pair.get("unwound"):
                 if (now_ts - float(pair.get("created_ts") or now_ts)) > 120:
                     self.pending_pair_unwinds.pop(pair_id, None)
+                continue
+            drop_trigger = self._pair_unwind_price_drop_trigger(pair)
+            if drop_trigger is not None:
+                side, entry, mark = drop_trigger
+                if not pair.get("price_drop_triggered"):
+                    pair["price_drop_triggered"] = True
+                    self.logger.warning(
+                        "Pair unwind emergency trigger: filled side %s dropped >=$0.10 while opposite leg pending; pair_id=%s entry=%.4f mark=%.4f",
+                        side,
+                        pair_id,
+                        entry,
+                        mark,
+                    )
+                self._attempt_pair_unwind(pair_id, reason="price_drop", fast_exit=True)
                 continue
             age = now_ts - float(pair.get("created_ts") or now_ts)
             if age < 5.0:
@@ -2964,20 +3044,48 @@ th{{background:#1a2448}}
             self._record_skip(f"risk_sell:pending:{side}")
             return False
 
+        settle_gate = self.risk_sell_settle_gate.get(side, {"until": 0.0, "target": 0.0})
+        gate_until = float(settle_gate.get("until") or 0.0)
+        gate_target = max(0.0, float(settle_gate.get("target") or 0.0))
+        now_ts = time.time()
+        if gate_until > 0:
+            if held <= (gate_target + 0.05):
+                self.risk_sell_settle_gate[side] = {"until": 0.0, "target": 0.0}
+            elif now_ts < gate_until:
+                self._record_skip(f"risk_sell:settle_wait:{side}")
+                return False
+            else:
+                self.risk_sell_settle_gate[side]["until"] = 0.0
+
+        if time.time() < float(self.risk_sell_side_hold_until.get(side, 0.0)):
+            self._record_skip(f"risk_sell:side_hold:{side}")
+            return False
+
         pnl_per_share = bid - avg
+        panic_mode = pnl_per_share <= -0.10
         if reason == "imbalance":
             if pnl_per_share < -self.inventory_stop_loss_cents:
                 reason = "imbalance_stop"
             elif pnl_per_share >= self.inventory_take_profit_cents:
                 reason = "imbalance_take"
+        if panic_mode:
+            reason = f"{reason}_panic" if reason else "panic"
 
         sell_px = self._sell_limit_price(bid, ask)
+        if panic_mode and bid is not None:
+            tick = max(0.001, self.meta.tick_size)
+            panic_px = max(tick, min(0.999, bid - 0.01))
+            sell_px = max(tick, math.floor(panic_px / tick) * tick)
         if sell_px is None:
             self._record_skip("risk_sell:no_price")
             return False
         qty_avail = min(held, self._available_qty_for_side(side))
-        qty = min(self.step_shares, qty_avail, bid_sz, max(0.0, qty_need))
-        if qty <= 0 or not self._meets_min_order(sell_px, qty):
+        if panic_mode:
+            qty = min(self.step_shares, qty_avail)
+        else:
+            qty = min(self.step_shares, qty_avail, bid_sz, max(0.0, qty_need))
+        min_ok = ((qty >= 0.1 and (sell_px * qty) >= 0.05) if panic_mode else self._meets_min_order(sell_px, qty))
+        if qty <= 0 or not min_ok:
             self._record_skip("risk_sell:min_order")
             return False
 
@@ -2990,14 +3098,41 @@ th{{background:#1a2448}}
                 sell_oid = self._extract_order_id_any(err or "")
                 if sell_oid:
                     self._queue_pending_risk_sell_check(side, token, sell_oid, qty, sell_px, reason, action)
+                    self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
+                    self.risk_sell_settle_gate[side] = {
+                        "until": time.time() + 12.0,
+                        "target": max(0.0, held - qty),
+                    }
                     self._record_skip("risk_sell:pending_recheck")
                     return False
+            low = (err or "").lower()
+            if "not enough balance" in low or "allowance" in low:
+                # A previous sell likely filled and local positions are stale. Pause retries for this side.
+                self.risk_sell_settle_gate[side] = {
+                    "until": time.time() + 12.0,
+                    "target": max(0.0, held - max(0.1, qty * 0.5)),
+                }
+                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
+                self._record_skip(f"risk_sell:balance_settle_wait:{side}")
             self._record_skip("risk_sell:failed")
             return False
 
         credit = max(0.0, bid * qty * (1.0 - self.meta.taker_fee_rate))
         self.spent_est = max(0.0, self.spent_est - credit)
+        self.post_risk_rebalance_cooldown_until_ts = max(
+            self.post_risk_rebalance_cooldown_until_ts,
+            time.time() + max(3.0, self.poll_s * 6.0),
+        )
+        self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
+        self.risk_sell_settle_gate[side] = {
+            "until": time.time() + 12.0,
+            "target": max(0.0, held - qty),
+        }
+        self.require_rebuild_after_risk_sell = True
         return True
+
+    def _post_risk_rebalance_cooldown_remaining_s(self) -> float:
+        return max(0.0, self.post_risk_rebalance_cooldown_until_ts - time.time())
 
     def refresh_wallet_debug(self, force: bool = False) -> WalletDebug:
         if (not force) and (time.time() - self._wallet_debug_last_ts < self.wallet_refresh_interval_s):
@@ -3058,6 +3193,9 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
+        allow_completion_discount = "complete bundles" in (note or "").lower()
+        if not self._is_allowed_original_arb_buy_price(price, allow_completion_discount=allow_completion_discount):
+            return False, "price_band_reject"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)
@@ -3217,6 +3355,10 @@ th{{background:#1a2448}}
                 self._record_skip("instant:nudged_sum_ge_1")
                 return
 
+        if (not self._is_allowed_original_arb_buy_price(up_buy_px)) or (not self._is_allowed_original_arb_buy_price(dn_buy_px)):
+            self._record_skip("instant:price_band")
+            return
+
         self.opps_met += 1
         # Execute two buys (not atomic)
         pair_id = f"instant-{int(time.time() * 1000)}-{self.executed_trade_count}"
@@ -3277,6 +3419,12 @@ th{{background:#1a2448}}
             self.rebalance_only_mode = True
 
     def try_complete_from_inventory(self, books: TopOfBook, pos: PositionSnapshot):
+        if self.require_rebuild_after_risk_sell:
+            self._record_skip("complete:reset_after_risk_sell")
+            return
+        if self._post_risk_rebalance_cooldown_remaining_s() > 0:
+            self._record_skip("complete:post_risk_rebalance_cooldown")
+            return
         if not self._can_open_new_buy():
             self._record_skip("buy:max_trades")
             return
@@ -3298,15 +3446,18 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
-                        ts = now_utc().astimezone().strftime("%H:%M:%S")
-                        action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("complete bundles", books.dn_ask, books.dn_ask), ok, err)
-                        self.log_action(action)
-                        if (not ok) and ("order_not_filled_immediately" in (err or "")):
-                            self._queue_pending_fill_check(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles", err, action)
-                        if ok:
-                            self._record_purchase(self.meta.token_ids[1], books.dn_ask, qty)
-                            self.spent_est += self.est_effective_cost(books.dn_ask * qty)
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask, allow_completion_discount=True):
+                            self._record_skip("complete_down:price_band")
+                        else:
+                            ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
+                            action = TradeAction(ts, "BUY", "DOWN", qty, books.dn_ask, self._buy_note("complete bundles", books.dn_ask, books.dn_ask), ok, err)
+                            self.log_action(action)
+                            if (not ok) and ("order_not_filled_immediately" in (err or "")):
+                                self._queue_pending_fill_check(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles", err, action)
+                            if ok:
+                                self._record_purchase(self.meta.token_ids[1], books.dn_ask, qty)
+                                self.spent_est += self.est_effective_cost(books.dn_ask * qty)
 
         # If you have unhedged DOWN, try buying UP to complete
         if books.up_ask is not None and pos.unhedged_down > 0:
@@ -3325,15 +3476,18 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
-                        ts = now_utc().astimezone().strftime("%H:%M:%S")
-                        action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("complete bundles", books.up_ask, books.up_ask), ok, err)
-                        self.log_action(action)
-                        if (not ok) and ("order_not_filled_immediately" in (err or "")):
-                            self._queue_pending_fill_check(self.meta.token_ids[0], books.up_ask, qty, "complete bundles", err, action)
-                        if ok:
-                            self._record_purchase(self.meta.token_ids[0], books.up_ask, qty)
-                            self.spent_est += self.est_effective_cost(books.up_ask * qty)
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask, allow_completion_discount=True):
+                            self._record_skip("complete_up:price_band")
+                        else:
+                            ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
+                            ts = now_utc().astimezone().strftime("%H:%M:%S")
+                            action = TradeAction(ts, "BUY", "UP", qty, books.up_ask, self._buy_note("complete bundles", books.up_ask, books.up_ask), ok, err)
+                            self.log_action(action)
+                            if (not ok) and ("order_not_filled_immediately" in (err or "")):
+                                self._queue_pending_fill_check(self.meta.token_ids[0], books.up_ask, qty, "complete bundles", err, action)
+                            if ok:
+                                self._record_purchase(self.meta.token_ids[0], books.up_ask, qty)
+                                self.spent_est += self.est_effective_cost(books.up_ask * qty)
 
     def try_build_inventory(self, books: TopOfBook, pos: PositionSnapshot):
         if not self._can_open_new_buy():
@@ -3393,6 +3547,10 @@ th{{background:#1a2448}}
                 self._record_skip("build:settlement_guard")
                 return
 
+        if not self._is_allowed_original_arb_buy_price(px):
+            self._record_skip("build:price_band")
+            return
+
         ok, err = self._post_buy(token, px, qty, "build inventory")
         ts = now_utc().astimezone().strftime("%H:%M:%S")
         action = TradeAction(ts, "BUY", side, qty, px, self._buy_note("build inventory", px, px), ok, err)
@@ -3402,6 +3560,7 @@ th{{background:#1a2448}}
         if ok:
             self._record_purchase(token, px, qty)
             self.spent_est += self.est_effective_cost(px * qty)
+            self.require_rebuild_after_risk_sell = False
 
     def _rpc_json(self, url: str, payload: Dict[str, Any], timeout_s: float = 2.5) -> Optional[Dict[str, Any]]:
         try:
@@ -4856,6 +5015,15 @@ th{{background:#1a2448}}
             self.try_flip_scalp(books, pos)
         elif sold_risk:
             decision_lines.append("Executed risk-reducing SELL to cut one-sided exposure; deferring new BUYs this cycle.")
+        elif self.require_rebuild_after_risk_sell:
+            decision_lines.append("Risk-sell reset active: completion buys paused until a new inventory-build buy succeeds.")
+            status_bits.append("Reset-after-risk-sell: build inventory first")
+        elif self._post_risk_rebalance_cooldown_remaining_s() > 0:
+            rem_cd = int(math.ceil(self._post_risk_rebalance_cooldown_remaining_s()))
+            decision_lines.append(
+                f"Post-risk-sell cooldown active ({rem_cd}s): skipping completion buys to avoid acting on stale inventory snapshots."
+            )
+            status_bits.append(f"Post-risk-sell completion cooldown {rem_cd}s")
         elif self.scalp_only_mode:
             status_bits.append("Penny scalping mode: watching oscillation pattern for +$0.01 exits")
             self.try_flip_scalp(books, pos)
@@ -4883,6 +5051,13 @@ th{{background:#1a2448}}
             status_bits.append("Fortress mode: buy-only pair lock with bounded directional tilt")
             self._update_flip_history(books)
             self.try_fortress_mode(books, pos, runtime_stats)
+        elif (self.market_open_wait_remaining_s() or 0) > 0:
+            remaining_s = self.market_open_wait_remaining_s() or 0
+            self._record_skip("step:post_open_wait")
+            decision_lines.append(
+                f"Post-open hold active: waiting {remaining_s}s before allowing new entries (configured delay={self.market_open_delay_s}s)."
+            )
+            status_bits.append(f"Post-open wait {remaining_s}s")
         elif risky_imbalance or self.rebalance_only_mode:
             self._record_skip("step:imbalance_hold")
             decision_lines.append(
@@ -4931,6 +5106,7 @@ th{{background:#1a2448}}
         decision_lines.append(
             f"Trade cap: used={self.executed_trade_count} / max={'∞' if rem_trades is None else self.max_trades} (includes buys+sells)"
         )
+        decision_lines.append(f"Post-open wait setting: {self.market_open_delay_s}s")
         if not self.disable_flip_scalp or self.scalp_only_mode:
             decision_lines.append(
                 f"Flip scalp: enabled={not self.disable_flip_scalp} open_positions={len(self.flip_open)} "
@@ -5068,7 +5244,8 @@ def build_ui(
         Layout(name="decision", ratio=1),
     )
 
-    title = Text("ML Learning (buy-only)" if ml_mode else "Polymarket Inventory-Arb (buy-only)", style="bold")
+    title_base = "ML Learning (buy-only)" if ml_mode else "Polymarket Inventory-Arb (buy-only)"
+    title = Text(f"{title_base} [{BOT_VERSION}]", style="bold")
     display_live = live_mode and (not ml_mode)
     status = Text("LIVE" if display_live else "PAPER", style="bold red" if display_live else "bold green")
     header = Table.grid(expand=True)
@@ -5194,7 +5371,7 @@ def build_ui(
         btc_delta_pct = ((btc_spot_price - btc_open_price) / btc_open_price) * 100.0
         btc_delta_txt = f"{btc_delta_pct:+.3f}%"
     footer = Text(
-        f"Status: {status_bar_text}\n{feed_line} | BTC now/open={'-' if btc_spot_price is None else f'{btc_spot_price:,.2f}'}/{'-' if btc_open_price is None else f'{btc_open_price:,.2f}'} ({btc_delta_txt}, src={btc_price_source}, t={fmt_toronto_hms(btc_last_update_ts)}, open_src={btc_open_source}) | poll_interval={poll_interval_s:.2f}s | log={log_path}",
+        f"Status: {status_bar_text}\nversion={BOT_VERSION} | {feed_line} | BTC now/open={'-' if btc_spot_price is None else f'{btc_spot_price:,.2f}'}/{'-' if btc_open_price is None else f'{btc_open_price:,.2f}'} ({btc_delta_txt}, src={btc_price_source}, t={fmt_toronto_hms(btc_last_update_ts)}, open_src={btc_open_source}) | poll_interval={poll_interval_s:.2f}s | log={log_path}",
         style="dim",
     )
     layout["footer"].update(Align.left(footer))
@@ -5390,6 +5567,7 @@ def main():
     ap.add_argument("--min-order-usd", type=float, default=1.0, help="Skip orders below this notional in USD")
     ap.add_argument("--max-session-shares", type=float, default=15.0, help="Maximum total BUY shares per market session")
     ap.add_argument("--max-trades", type=int, default=0, help="Maximum total executed trades this run (buy+sell, 0 = unlimited). Exit sells are always allowed.")
+    ap.add_argument("--market-open-delay-s", type=int, choices=[5, 10, 15, 30], default=5, help="Seconds to wait after market open before allowing entries")
     ap.add_argument("--hedge-minor-loss-limit", type=float, default=1.0, help="Hedge mode: keep worst-case settlement PnL above -this USD when possible")
     ap.add_argument("--hedge-upside-allocation", type=float, default=0.35, help="Hedge mode: fraction of safety buffer usable for directional upside adds")
     ap.add_argument("--hedge-max-extra-shares", type=float, default=2.0, help="Hedge mode: max shares per directional upside add")
@@ -5605,6 +5783,7 @@ def main():
         min_order_usd=args.min_order_usd,
         max_session_shares=args.max_session_shares,
         max_trades=args.max_trades,
+        market_open_delay_s=args.market_open_delay_s,
         disable_flip_scalp=disable_flip_scalp,
         scalp_only_mode=scalp_only_mode,
         upswing_only_mode=upswing_only_mode,
@@ -5642,6 +5821,9 @@ def main():
         price_feed_mode=args.price_feed,
         ws_url=args.ws_url,
     )
+    logger.info("================ MARKET START ================")
+    logger.info("market_slug=%s question=%s start_utc=%s end_utc=%s", meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
+    logger.info("==============================================")
 
     initial_wallet_diag = trader.refresh_wallet_debug(force=True)
     logger.info(
@@ -5715,6 +5897,9 @@ def main():
                     logger.info("Auto-switching to next market because %ss left. from_slug=%s next_slug=%s", tte, prev_slug, next_slug)
                     try:
                         meta = fetch_market_meta(gamma_host, next_slug, logger)
+                        logger.info("================ MARKET SWITCH ===============")
+                        logger.info("from_slug=%s to_slug=%s question=%s start_utc=%s end_utc=%s", prev_slug, meta.slug, meta.question, meta.start_dt_utc, meta.end_dt_utc)
+                        logger.info("==============================================")
                         trader = Trader(
                             public_client=public_client,
                             authed_client=authed_client,
@@ -5736,6 +5921,7 @@ def main():
                             min_order_usd=args.min_order_usd,
                             max_session_shares=args.max_session_shares,
                             max_trades=args.max_trades,
+                            market_open_delay_s=args.market_open_delay_s,
                             disable_flip_scalp=disable_flip_scalp,
                             scalp_only_mode=scalp_only_mode,
                             upswing_only_mode=upswing_only_mode,

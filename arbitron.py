@@ -1572,8 +1572,6 @@ class Trader:
         self.pending_pair_unwinds: Dict[str, Dict[str, Any]] = {}
         self.pending_unwind_sell_checks: List[Dict[str, Any]] = []
         self.pending_risk_sell_checks: List[Dict[str, Any]] = []
-        self.risk_sell_side_hold_until: Dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
-        self.risk_sell_settle_gate: Dict[str, Dict[str, float]] = {"UP": {"until": 0.0, "target": 0.0}, "DOWN": {"until": 0.0, "target": 0.0}}
         self.post_risk_rebalance_cooldown_until_ts = 0.0
         self.pair_fill_grace_until_ts = 0.0
         self.next_pending_recheck_ts = 0.0
@@ -2274,15 +2272,10 @@ th{{background:#1a2448}}
         ask_txt = "-" if ask_px is None else f"{ask_px:.4f}"
         return f"{base} | ask={ask_txt} submit={submit_px:.4f}"
 
-    def _is_allowed_original_arb_buy_price(self, price: float, *, allow_completion_discount: bool = False) -> bool:
+    def _is_allowed_original_arb_buy_price(self, price: float) -> bool:
         if not self._is_original_arb_mode():
             return True
-        px = float(price)
-        if 0.45 <= px <= 0.55:
-            return True
-        if allow_completion_discount and px < 0.45:
-            return True
-        return False
+        return 0.45 <= float(price) <= 0.55
 
     def _sell_limit_price(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
         if bid is None and ask is None:
@@ -3040,23 +3033,6 @@ th{{background:#1a2448}}
             self._record_skip(f"risk_sell:pending:{side}")
             return False
 
-        settle_gate = self.risk_sell_settle_gate.get(side, {"until": 0.0, "target": 0.0})
-        gate_until = float(settle_gate.get("until") or 0.0)
-        gate_target = max(0.0, float(settle_gate.get("target") or 0.0))
-        now_ts = time.time()
-        if gate_until > 0:
-            if held <= (gate_target + 0.05):
-                self.risk_sell_settle_gate[side] = {"until": 0.0, "target": 0.0}
-            elif now_ts < gate_until:
-                self._record_skip(f"risk_sell:settle_wait:{side}")
-                return False
-            else:
-                self.risk_sell_settle_gate[side]["until"] = 0.0
-
-        if time.time() < float(self.risk_sell_side_hold_until.get(side, 0.0)):
-            self._record_skip(f"risk_sell:side_hold:{side}")
-            return False
-
         pnl_per_share = bid - avg
         panic_mode = pnl_per_share <= -0.10
         if reason == "imbalance":
@@ -3094,22 +3070,8 @@ th{{background:#1a2448}}
                 sell_oid = self._extract_order_id_any(err or "")
                 if sell_oid:
                     self._queue_pending_risk_sell_check(side, token, sell_oid, qty, sell_px, reason, action)
-                    self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-                    self.risk_sell_settle_gate[side] = {
-                        "until": time.time() + 12.0,
-                        "target": max(0.0, held - qty),
-                    }
                     self._record_skip("risk_sell:pending_recheck")
                     return False
-            low = (err or "").lower()
-            if "not enough balance" in low or "allowance" in low:
-                # A previous sell likely filled and local positions are stale. Pause retries for this side.
-                self.risk_sell_settle_gate[side] = {
-                    "until": time.time() + 12.0,
-                    "target": max(0.0, held - max(0.1, qty * 0.5)),
-                }
-                self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 8.0)
-                self._record_skip(f"risk_sell:balance_settle_wait:{side}")
             self._record_skip("risk_sell:failed")
             return False
 
@@ -3119,11 +3081,6 @@ th{{background:#1a2448}}
             self.post_risk_rebalance_cooldown_until_ts,
             time.time() + max(3.0, self.poll_s * 6.0),
         )
-        self.risk_sell_side_hold_until[side] = max(self.risk_sell_side_hold_until.get(side, 0.0), time.time() + 4.0)
-        self.risk_sell_settle_gate[side] = {
-            "until": time.time() + 12.0,
-            "target": max(0.0, held - qty),
-        }
         return True
 
     def _post_risk_rebalance_cooldown_remaining_s(self) -> float:
@@ -3188,9 +3145,8 @@ th{{background:#1a2448}}
         return self.wallet_debug
 
     def _post_buy(self, token_id: str, price: float, size: float, note: str) -> Tuple[bool, str]:
-        allow_completion_discount = "complete bundles" in (note or "").lower()
-        if not self._is_allowed_original_arb_buy_price(price, allow_completion_discount=allow_completion_discount):
-            return False, "price_band_reject"
+        if self._is_original_arb_mode() and not (0.45 <= float(price) <= 0.55):
+            return False, "Original arbitrage mode buy price must be within $0.45-$0.55"
         if not self.live:
             # Paper mode: always "fills"
             self._record_paper_fill(token_id, price, size)
@@ -3438,7 +3394,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(0.0, qty, added_paid):
                             self._record_skip("complete_down:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.dn_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.dn_ask):
                             self._record_skip("complete_down:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[1], books.dn_ask, qty, "complete bundles")
@@ -3468,7 +3424,7 @@ th{{background:#1a2448}}
                         if not self._can_buy_without_breaking_settlement_floor(qty, 0.0, added_paid):
                             self._record_skip("complete_up:settlement_guard")
                             return
-                        if not self._is_allowed_original_arb_buy_price(books.up_ask, allow_completion_discount=True):
+                        if not self._is_allowed_original_arb_buy_price(books.up_ask):
                             self._record_skip("complete_up:price_band")
                         else:
                             ok, err = self._post_buy(self.meta.token_ids[0], books.up_ask, qty, "complete bundles")
